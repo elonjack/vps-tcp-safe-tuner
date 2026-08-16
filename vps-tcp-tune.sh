@@ -6,7 +6,7 @@ set -Eeuo pipefail
 IFS=$'\n\t'
 umask 077
 
-readonly VERSION='3.3.1'
+readonly VERSION='3.3.2'
 readonly STATE_DIR='/var/lib/vps-tcp-safe-tuner'
 readonly SNAPSHOT_FILE="$STATE_DIR/baseline.tsv"
 readonly FACTS_FILE="$STATE_DIR/facts.tsv"
@@ -666,7 +666,7 @@ menu() {
 EOF
 )"
   printf '\n'
-  local choice; yellow '[选择] '; read -r choice
+  local choice; yellow '请选择：'; read -r choice
   case "$choice" in
     1) yellow '[对端域名或 IPv4，回车自动选择公共节点] '; read -r PEER; yellow '[用途 general/proxy/server，默认 general] '; read -r ROLE; ROLE=${ROLE:-general}; auto ;;
     2) yellow '[带宽 Mbit] '; read -r BANDWIDTH_MBIT; yellow '[典型 RTT ms] '; read -r RTT_MS; yellow '[用途 general/proxy/server，默认 general] '; read -r ROLE; ROLE=${ROLE:-general}; apply_tuning ;;

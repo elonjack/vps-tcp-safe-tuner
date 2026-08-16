@@ -36,7 +36,7 @@
 一键安装固定版本。安装器会下载 GitHub Release 资产并在安装前校验 SHA-256：
 
 ```bash
-bash <(curl -fsSL https://raw.githubusercontent.com/elonjack/vps-tcp-safe-tuner/v3.3.1/install.sh)
+bash <(curl -fsSL https://raw.githubusercontent.com/elonjack/vps-tcp-safe-tuner/v3.3.2/install.sh)
 ```
 
 安装后可直接运行：
