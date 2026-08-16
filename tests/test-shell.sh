@@ -19,6 +19,9 @@ export RTT_MS=150
 export ROLE=general
 export BUFFER_MULTIPLIER_OVERRIDE=''
 assert_equals 10650000 "$(calculate_buffer)" '跨境 150ms BDP 缓冲区推导'
+export ROLE=proxy
+assert_equals 1048576 "$(calculate_initial_buffer "$(calculate_buffer)")" '代理初始收发缓冲区'
+export ROLE=general
 
 parse_iperf_result '[SUM]   0.00-10.00  sec  1.10 GBytes   944 Mbits/sec    3             sender
 [SUM]   0.00-10.00  sec  1.08 GBytes   928 Mbits/sec                  receiver'

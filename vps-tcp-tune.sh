@@ -6,7 +6,7 @@ set -Eeuo pipefail
 IFS=$'\n\t'
 umask 077
 
-readonly VERSION='3.5.0'
+readonly VERSION='3.6.0'
 readonly STATE_DIR='/var/lib/vps-tcp-safe-tuner'
 readonly SNAPSHOT_FILE="$STATE_DIR/baseline.tsv"
 readonly FACTS_FILE="$STATE_DIR/facts.tsv"
@@ -304,17 +304,28 @@ calculate_buffer() {
   result=$(( bdp * multiplier )); (( result < 4194304 )) && result=4194304; (( result > cap )) && result=$cap; (( result < 4194304 )) && result=4194304
   printf '%s' "$result"
 }
+calculate_initial_buffer() {
+  local ceiling=$1 initial
+  # 代理连接需更快完成请求/首包交换；上限仍由 BDP 和内存限制。
+  case "$ROLE" in
+    proxy) initial=1048576 ;;
+    *) initial=524288 ;;
+  esac
+  (( initial > ceiling )) && initial=$ceiling
+  printf '%s' "$initial"
+}
 calculate_backlog() { if (( BANDWIDTH_MBIT >= 5000 )); then printf 20000; elif (( BANDWIDTH_MBIT >= 1000 )); then printf 10000; elif (( BANDWIDTH_MBIT >= 200 )); then printf 5000; else printf 2500; fi; }
 
 declare -a KEYS=() VALUES=()
 add_setting() { sysctl_exists "$1" || { warn "内核不支持 $1，已跳过。"; return 0; }; KEYS+=("$1"); VALUES+=("$2"); }
 build_settings() {
-  local buffer backlog socket_queue syn_queue
+  local buffer initial_buffer backlog socket_queue syn_queue
   KEYS=(); VALUES=()
-  buffer=$(calculate_buffer); backlog=$(calculate_backlog); case "$ROLE" in proxy|server) socket_queue=8192; syn_queue=8192 ;; *) socket_queue=4096; syn_queue=4096 ;; esac
+  buffer=$(calculate_buffer); initial_buffer=$(calculate_initial_buffer "$buffer"); backlog=$(calculate_backlog); case "$ROLE" in proxy|server) socket_queue=8192; syn_queue=8192 ;; *) socket_queue=4096; syn_queue=4096 ;; esac
   add_setting net.core.default_qdisc fq; add_setting net.ipv4.tcp_congestion_control bbr
   add_setting net.core.rmem_max "$buffer"; add_setting net.core.wmem_max "$buffer"
-  add_setting net.ipv4.tcp_rmem "4096 131072 $buffer"; add_setting net.ipv4.tcp_wmem "4096 16384 $buffer"
+  add_setting net.core.rmem_default "$initial_buffer"; add_setting net.core.wmem_default "$initial_buffer"
+  add_setting net.ipv4.tcp_rmem "4096 $initial_buffer $buffer"; add_setting net.ipv4.tcp_wmem "4096 $initial_buffer $buffer"
   add_setting net.ipv4.tcp_mtu_probing 1; add_setting net.ipv4.tcp_slow_start_after_idle 0; add_setting net.ipv4.tcp_moderate_rcvbuf 1
   add_setting net.core.netdev_max_backlog "$backlog"; add_setting net.core.somaxconn "$socket_queue"; add_setting net.ipv4.tcp_max_syn_backlog "$syn_queue"
   [[ $ROLE != proxy ]] || add_setting net.ipv4.ip_local_port_range '10240 65535'
@@ -328,17 +339,25 @@ show_environment() {
   [[ -z $iface ]] || say "活动根 qdisc：$(tc qdisc show dev "$iface" 2>/dev/null | awk 'NR==1 {print $2}')"; line
 }
 show_plan() {
-  local i buffer; buffer=$(calculate_buffer); show_environment
-  say "用途=$ROLE；带宽=${BANDWIDTH_MBIT} Mbit/s；业务目标 RTT=${RTT_MS} ms；推导缓冲区=${buffer} 字节。"
+  local i buffer initial_buffer; buffer=$(calculate_buffer); initial_buffer=$(calculate_initial_buffer "$buffer"); show_environment
+  say "用途=$ROLE；带宽=${BANDWIDTH_MBIT} Mbit/s；业务目标 RTT=${RTT_MS} ms；推导缓冲区上限=${buffer} 字节；初始收发缓冲区=${initial_buffer} 字节。"
   for i in "${!KEYS[@]}"; do say "${KEYS[$i]}：$(sysctl_value "${KEYS[$i]}") -> ${VALUES[$i]}"; done
   say '默认 qdisc 不会替换现有活动根队列；只有明确执行 shape 时才会改动它。'
 }
 
 snapshot_if_needed() {
   if [[ -e $CONFIG_FILE ]] && ! grep -Fqx "$MARKER" "$CONFIG_FILE"; then fail "拒绝覆盖非本工具配置：$CONFIG_FILE"; fi
-  [[ -e $SNAPSHOT_FILE ]] && return 0; install -d -m 700 "$STATE_DIR"
-  local tmp i; tmp=$(mktemp "$STATE_DIR/baseline.XXXXXX"); chmod 600 "$tmp"
-  for i in "${!KEYS[@]}"; do printf '%s\t%s\n' "${KEYS[$i]}" "$(sysctl_value "${KEYS[$i]}")" >>"$tmp"; done; mv -f "$tmp" "$SNAPSHOT_FILE"
+  install -d -m 700 "$STATE_DIR"
+  local tmp i changed=0
+  tmp=$(mktemp "$STATE_DIR/baseline.XXXXXX"); chmod 600 "$tmp"
+  [[ -f $SNAPSHOT_FILE ]] && cat "$SNAPSHOT_FILE" >"$tmp"
+  for i in "${!KEYS[@]}"; do
+    if [[ ! -f $SNAPSHOT_FILE ]] || ! awk -F'\t' -v wanted="${KEYS[$i]}" '$1 == wanted { found=1 } END { exit !found }' "$SNAPSHOT_FILE"; then
+      printf '%s\t%s\n' "${KEYS[$i]}" "$(sysctl_value "${KEYS[$i]}")" >>"$tmp"
+      changed=1
+    fi
+  done
+  if [[ ! -f $SNAPSHOT_FILE || $changed -eq 1 ]]; then mv -f "$tmp" "$SNAPSHOT_FILE"; else rm -f "$tmp"; fi
 }
 write_facts() {
   install -d -m 700 "$STATE_DIR"
@@ -708,8 +727,8 @@ EOF
   printf '\n'
   local choice; yellow '请选择：'; read -r choice
   case "$choice" in
-    1) yellow '[对端域名或 IPv4，回车自动选择公共节点] '; read -r PEER; yellow '[用途 general/proxy/server，默认 general] '; read -r ROLE; ROLE=${ROLE:-general}; auto ;;
-    2) yellow '[带宽 Mbit] '; read -r BANDWIDTH_MBIT; yellow '[典型 RTT ms] '; read -r RTT_MS; yellow '[用途 general/proxy/server，默认 general] '; read -r ROLE; ROLE=${ROLE:-general}; apply_tuning ;;
+    1) yellow '[对端域名或 IPv4，回车自动选择公共节点] '; read -r PEER; yellow '[用途 general=通用 / proxy=代理加速 / server=建站服务，默认 general] '; read -r ROLE; ROLE=${ROLE:-general}; auto ;;
+    2) yellow '[带宽 Mbit] '; read -r BANDWIDTH_MBIT; yellow '[典型 RTT ms] '; read -r RTT_MS; yellow '[用途 general=通用 / proxy=代理加速 / server=建站服务，默认 general] '; read -r ROLE; ROLE=${ROLE:-general}; apply_tuning ;;
     3) audit ;; 4) status ;; 5) rollback ;; 0) say '已退出。' ;; *) fail '无效选择。' ;;
   esac
 }

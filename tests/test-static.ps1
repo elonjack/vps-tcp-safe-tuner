@@ -16,5 +16,8 @@ if ($content -notmatch 'BBR_MODULE_MARKER') { throw 'Missing managed BBR persist
 if ($content -match 'awk\s+-v\s+index=') { throw 'Do not shadow the awk index() builtin.' }
 if ($content -notmatch "AUTO_TARGET_RTT_MS='150'") { throw 'Missing cross-region BDP target RTT.' }
 if ($content -match 'RTT_MS=\$MEASURE_RTT') { throw 'Do not use a near measurement peer RTT as the BDP target RTT.' }
+if ($content -notmatch 'calculate_initial_buffer') { throw 'Missing role-aware initial TCP buffer calculation.' }
+if ($content -notmatch 'net\.core\.rmem_default') { throw 'Missing TCP receive default buffer setting.' }
+if ($content -notmatch 'net\.core\.wmem_default') { throw 'Missing TCP send default buffer setting.' }
 
 Write-Host 'Static security checks passed.'
