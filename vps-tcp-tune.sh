@@ -6,7 +6,6 @@ set -Eeuo pipefail
 IFS=$'\n\t'
 umask 077
 
-readonly PROGRAM='vps-tcp-tune'
 readonly VERSION='1.0.0'
 readonly STATE_DIR='/var/lib/vps-tcp-safe-tuner'
 readonly SNAPSHOT_FILE="$STATE_DIR/baseline.tsv"
@@ -119,7 +118,7 @@ validate_profile() {
 # 高吞吐档的单 socket 最大缓冲区：2×BDP，限制在 4 MiB 到 min(64 MiB, 内存/16)。
 # 这样不套用固定大数，也不会把小内存 VPS 的每连接上限无限放大。
 calculated_buffer_bytes() {
-  local bdp cap ram result
+  local bdp cap result
   bdp=$(( BANDWIDTH_MBIT * RTT_MS / 8 ))
   cap=$(( $(memory_mib) * 1024 * 1024 / 16 ))
   (( cap > 67108864 )) && cap=67108864
