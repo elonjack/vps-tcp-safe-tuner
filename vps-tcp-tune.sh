@@ -6,7 +6,7 @@ set -Eeuo pipefail
 IFS=$'\n\t'
 umask 077
 
-readonly VERSION='3.4.1'
+readonly VERSION='3.5.0'
 readonly STATE_DIR='/var/lib/vps-tcp-safe-tuner'
 readonly SNAPSHOT_FILE="$STATE_DIR/baseline.tsv"
 readonly FACTS_FILE="$STATE_DIR/facts.tsv"
@@ -19,6 +19,7 @@ readonly BBR_MODULE_FILE='/etc/modules-load.d/vps-tcp-safe-tuner-bbr.conf'
 readonly REPORT_DIR='/var/log/vps-tcp-safe-tuner'
 readonly MARKER='# Managed by vps-tcp-safe-tuner. Remove only with vps-tcp-tune rollback.'
 readonly BBR_MODULE_MARKER='# Managed by vps-tcp-safe-tuner: load BBR at boot.'
+readonly AUTO_TARGET_RTT_MS='150'
 
 COMMAND='menu'; ROLE='general'; PEER=''; PEER_PORT='5201'; BANDWIDTH_MBIT=''; RTT_MS=''
 DURATION='12'; WORKERS='4'; ROUNDS='3'; POLICER_ROUNDS='3'; PEER_MAX_RTT='120'; BUFFER_MULTIPLIER_OVERRIDE=''; SHAPE_RATE=''; ENABLE_SHAPING=0; BUFFER_SEARCH=0; DRY_RUN=0; ASSUME_YES=0; NO_INSTALL=0; KEEP_ON_REGRESSION=0
@@ -74,7 +75,7 @@ vps-tcp-tune - 自适应 Linux VPS TCP 调优工具
   --port PORT          对端端口，默认 5201
   --role general|proxy|server  用途影响队列和端口范围策略，默认 general
   --bandwidth MBIT     标称或实测出口带宽（Mbit/s）
-  --rtt MS             典型 RTT（毫秒）
+  --rtt MS             业务目标方向的典型 RTT（毫秒）；auto 默认 150
   --duration SEC       单次 iperf3 测试时长，默认 12 秒
   --workers N          iperf3 并发流数，默认 4
   --rounds N           每个阶段的独立测试轮数，默认 3，范围 1 到 5
@@ -92,6 +93,7 @@ vps-tcp-tune - 自适应 Linux VPS TCP 调优工具
   sudo bash vps-tcp-tune.sh audit
   sudo bash vps-tcp-tune.sh auto --peer 203.0.113.10 --role proxy
   sudo bash vps-tcp-tune.sh auto --rounds 3 --role proxy
+  sudo bash vps-tcp-tune.sh auto --rtt 180 --role proxy
   sudo bash vps-tcp-tune.sh apply --bandwidth 1000 --rtt 150 --role proxy
   sudo bash vps-tcp-tune.sh shape --shape-rate 950 --enable-shaping
   sudo bash vps-tcp-tune.sh rollback
@@ -289,7 +291,7 @@ infer_bandwidth_from_nic() {
 }
 derive_network_facts() {
   [[ -n $BANDWIDTH_MBIT ]] || { [[ -n $MEASURE_RATE ]] && BANDWIDTH_MBIT=$MEASURE_RATE || BANDWIDTH_MBIT=$(infer_bandwidth_from_nic || true); }
-  [[ -n $RTT_MS ]] || { [[ -n $MEASURE_RTT ]] && RTT_MS=$MEASURE_RTT; }
+  [[ -n $RTT_MS ]] || fail '无法取得业务目标 RTT；请提供 --rtt。'
   is_positive_integer "$BANDWIDTH_MBIT" || fail '无法推导出口带宽；请提供 --bandwidth 或使用 --peer 测试。'
   is_positive_integer "$RTT_MS" || fail '无法取得 RTT；请提供 --rtt（例如中国方向常用 150）。'
 }
@@ -326,7 +328,7 @@ show_environment() {
 }
 show_plan() {
   local i buffer; buffer=$(calculate_buffer); show_environment
-  say "用途=$ROLE；带宽=${BANDWIDTH_MBIT} Mbit/s；RTT=${RTT_MS} ms；推导缓冲区=${buffer} 字节。"
+  say "用途=$ROLE；带宽=${BANDWIDTH_MBIT} Mbit/s；业务目标 RTT=${RTT_MS} ms；推导缓冲区=${buffer} 字节。"
   for i in "${!KEYS[@]}"; do say "${KEYS[$i]}：$(sysctl_value "${KEYS[$i]}") -> ${VALUES[$i]}"; done
   say '默认 qdisc 不会替换现有活动根队列；只有明确执行 shape 时才会改动它。'
 }
@@ -339,7 +341,7 @@ snapshot_if_needed() {
 }
 write_facts() {
   install -d -m 700 "$STATE_DIR"
-  { printf 'role\t%s\n' "$ROLE"; printf 'bandwidth_mbit\t%s\n' "$BANDWIDTH_MBIT"; printf 'rtt_ms\t%s\n' "$RTT_MS"; printf 'buffer_bdp_multiplier\t%s\n' "${BUFFER_MULTIPLIER_OVERRIDE:-default}"; printf 'peer\t%s\n' "$PEER"; printf 'measured_mbit\t%s\n' "${MEASURE_RATE:-}"; printf 'measured_retrans\t%s\n' "${MEASURE_RETRANS:-}"; } >"$FACTS_FILE"
+  { printf 'role\t%s\n' "$ROLE"; printf 'bandwidth_mbit\t%s\n' "$BANDWIDTH_MBIT"; printf 'target_rtt_ms\t%s\n' "$RTT_MS"; printf 'test_peer_rtt_ms\t%s\n' "${MEASURE_RTT:-}"; printf 'buffer_bdp_multiplier\t%s\n' "${BUFFER_MULTIPLIER_OVERRIDE:-default}"; printf 'peer\t%s\n' "$PEER"; printf 'measured_mbit\t%s\n' "${MEASURE_RATE:-}"; printf 'measured_retrans\t%s\n' "${MEASURE_RETRANS:-}"; } >"$FACTS_FILE"
   chmod 600 "$FACTS_FILE"
 }
 write_experiment_report() {
@@ -354,7 +356,8 @@ write_experiment_report() {
     printf 'rounds\t%s\n' "$ROUNDS"
     printf 'duration_seconds\t%s\n' "$DURATION"
     printf 'workers\t%s\n' "$WORKERS"
-    printf 'rtt_ms\t%s\n' "$RTT_MS"
+    printf 'target_rtt_ms\t%s\n' "$RTT_MS"
+    printf 'test_peer_rtt_ms\t%s\n' "${MEASURE_RTT:-}"
     printf 'buffer_bdp_multiplier\t%s\n' "${BUFFER_MULTIPLIER_OVERRIDE:-default}"
     printf 'baseline_mbit\t%s\n' "$baseline_rate"
     printf 'baseline_retrans\t%s\n' "$baseline_retrans"
@@ -633,7 +636,13 @@ auto() {
   say '阶段 1/3：记录调优前基线。'
   measure
   baseline_rate=$MEASURE_RATE; baseline_retrans=$MEASURE_RETRANS
-  BANDWIDTH_MBIT=$MEASURE_RATE; [[ -n $MEASURE_RTT ]] && RTT_MS=$MEASURE_RTT
+  BANDWIDTH_MBIT=$MEASURE_RATE
+  if [[ -z $RTT_MS ]]; then
+    RTT_MS=$AUTO_TARGET_RTT_MS
+    say "测速对端 RTT 为 ${MEASURE_RTT:-未取得}ms，仅用于测量质量；BDP 按跨境业务默认目标 RTT ${RTT_MS}ms 推导。"
+  else
+    say "BDP 使用你指定的业务目标 RTT ${RTT_MS}ms；测速对端 RTT 为 ${MEASURE_RTT:-未取得}ms。"
+  fi
   derive_network_facts
   say '阶段 2/3：应用按基线推导的候选配置。'
   apply_tuning
