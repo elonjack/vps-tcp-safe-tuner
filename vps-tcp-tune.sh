@@ -6,7 +6,7 @@ set -Eeuo pipefail
 IFS=$'\n\t'
 umask 077
 
-readonly VERSION='3.2.0'
+readonly VERSION='3.3.0'
 readonly STATE_DIR='/var/lib/vps-tcp-safe-tuner'
 readonly SNAPSHOT_FILE="$STATE_DIR/baseline.tsv"
 readonly FACTS_FILE="$STATE_DIR/facts.tsv"
@@ -19,7 +19,7 @@ readonly REPORT_DIR='/var/log/vps-tcp-safe-tuner'
 readonly MARKER='# Managed by vps-tcp-safe-tuner. Remove only with vps-tcp-tune rollback.'
 
 COMMAND='menu'; ROLE='general'; PEER=''; PEER_PORT='5201'; BANDWIDTH_MBIT=''; RTT_MS=''
-DURATION='12'; WORKERS='4'; ROUNDS='3'; PEER_MAX_RTT='120'; BUFFER_MULTIPLIER_OVERRIDE=''; SHAPE_RATE=''; ENABLE_SHAPING=0; BUFFER_SEARCH=0; DRY_RUN=0; ASSUME_YES=0; NO_INSTALL=0; KEEP_ON_REGRESSION=0
+DURATION='12'; WORKERS='4'; ROUNDS='3'; POLICER_ROUNDS='3'; PEER_MAX_RTT='120'; BUFFER_MULTIPLIER_OVERRIDE=''; SHAPE_RATE=''; ENABLE_SHAPING=0; BUFFER_SEARCH=0; DRY_RUN=0; ASSUME_YES=0; NO_INSTALL=0; KEEP_ON_REGRESSION=0
 TUNING_APPLIED=0
 
 # 第三方公开 iperf3 节点。自动模式会按 RTT 排序、依次做短测试；用户也可用 --peer 覆盖。
@@ -76,6 +76,7 @@ vps-tcp-tune - 自适应 Linux VPS TCP 调优工具
   --duration SEC       单次 iperf3 测试时长，默认 12 秒
   --workers N          iperf3 并发流数，默认 4
   --rounds N           每个阶段的独立测试轮数，默认 3，范围 1 到 5
+  --policer-rounds N   每个限速器候选的测试轮数，默认 3，范围 2 到 5
   --peer-max-rtt MS    自动选择公共对端的最大 RTT，默认 120 ms
   --enable-shaping     auto 成功后，允许进入限速器扫描和整形候选流程
   --search-buffers     对 1×、2×、3× BDP 缓冲区进行 A/B 测试并自动保留最佳候选
@@ -135,6 +136,7 @@ validate_common() {
   is_positive_integer "$DURATION" && (( DURATION <= 120 )) || fail '--duration 必须是 1 到 120 的整数。'
   is_positive_integer "$WORKERS" && (( WORKERS <= 32 )) || fail '--workers 必须是 1 到 32 的整数。'
   is_positive_integer "$ROUNDS" && (( ROUNDS <= 5 )) || fail '--rounds 必须是 1 到 5 的整数。'
+  is_positive_integer "$POLICER_ROUNDS" && (( POLICER_ROUNDS >= 2 && POLICER_ROUNDS <= 5 )) || fail '--policer-rounds 必须是 2 到 5 的整数。'
   is_positive_integer "$PEER_MAX_RTT" && (( PEER_MAX_RTT <= 1000 )) || fail '--peer-max-rtt 必须是 1 到 1000 的整数。'
   [[ -z $BANDWIDTH_MBIT ]] || { is_positive_integer "$BANDWIDTH_MBIT" && (( BANDWIDTH_MBIT <= 100000 )) || fail '--bandwidth 必须是 1 到 100000 的整数。'; }
   [[ -z $RTT_MS ]] || { is_positive_integer "$RTT_MS" && (( RTT_MS <= 3000 )) || fail '--rtt 必须是 1 到 3000 的整数。'; }
@@ -409,26 +411,69 @@ search_buffer_candidates() {
   say "已选择 ${best_multiplier}× BDP 缓冲区：${best_rate}Mbit，累计重传 ${best_retrans}。"
 }
 
+qdisc_leaf_is_restorable() { case "$1" in fq|fq_codel|pfifo_fast|pfifo|bfifo) return 0 ;; *) return 1 ;; esac; }
+qdisc_is_restorable() { case "$1" in fq|fq_codel|pfifo_fast|pfifo|bfifo|mq) return 0 ;; *) return 1 ;; esac; }
+qdisc_snapshot_mq() {
+  local iface=$1 snapshot_file=$2 line kind parent spec found=0
+  : >"$snapshot_file"; chmod 600 "$snapshot_file"
+  while IFS= read -r line; do
+    [[ $line == qdisc\ * && $line == *' parent '* ]] || continue
+    kind=$(awk '{print $2}' <<<"$line")
+    parent=$(awk '{for (i = 1; i <= NF; i += 1) if ($i == "parent") {print $(i + 1); exit}}' <<<"$line")
+    qdisc_leaf_is_restorable "$kind" || return 1
+    [[ $parent =~ ^(:|[0-9]+:)[1-9][0-9]*$ ]] || return 1
+    spec=$(awk -v p="$parent" '{for (i = 1; i <= NF; i += 1) if ($i == "parent" && $(i + 1) == p) {for (j = i + 2; j <= NF; j += 1) printf "%s%s", (j == i + 2 ? "" : " "), $j; exit}}' <<<"$line")
+    printf '%s\t%s\t%s\n' "$kind" "$parent" "$spec" >>"$snapshot_file"
+    found=1
+  done < <(tc qdisc show dev "$iface" 2>/dev/null)
+  (( found ))
+}
 qdisc_snapshot() {
-  local line kind spec
-  line=$(tc qdisc show dev "$1" 2>/dev/null | awk 'NR == 1 {print}')
+  local iface=$1 snapshot_file=${2:-} line kind spec
+  line=$(tc qdisc show dev "$iface" 2>/dev/null | awk '$1 == "qdisc" {for (i = 1; i <= NF; i += 1) if ($i == "root") {print; exit}}')
   [[ -n $line ]] || return 1
   kind=$(awk '{print $2}' <<<"$line")
-  case "$kind" in fq|fq_codel|pfifo_fast|pfifo|bfifo) ;; *) return 1 ;; esac
+  if [[ $kind == mq ]]; then
+    [[ -n $snapshot_file ]] || return 1
+    qdisc_snapshot_mq "$iface" "$snapshot_file" || return 1
+    printf 'mq\t%s' "$snapshot_file"
+    return 0
+  fi
+  qdisc_leaf_is_restorable "$kind" || return 1
   # 保存 tc 输出中的根队列参数。仅对可无损重建的常见根队列开放整形。
   spec=$(sed -E 's/^qdisc [^ ]+ [^ ]+ root( refcnt [0-9]+)?[ ]*//' <<<"$line")
   printf '%s\t%s' "$kind" "$spec"
 }
-qdisc_is_restorable() { case "$1" in fq|fq_codel|pfifo_fast|pfifo|bfifo) return 0 ;; *) return 1 ;; esac; }
+restore_mq_root_qdisc() {
+  local iface=$1 snapshot_file=$2 kind parent spec minor
+  local -a arguments=()
+  [[ -f $snapshot_file ]] || return 1
+  tc qdisc replace dev "$iface" root handle 1: mq || return 1
+  while IFS=$'\t' read -r kind parent spec; do
+    qdisc_leaf_is_restorable "$kind" || return 1
+    [[ $parent =~ ^(:|[0-9]+:)[1-9][0-9]*$ ]] || return 1
+    minor=${parent##*:}
+    arguments=()
+    if [[ -n $spec ]]; then
+      local IFS=' '
+      read -r -a arguments <<<"$spec"
+    fi
+    tc qdisc replace dev "$iface" parent "1:$minor" "$kind" "${arguments[@]}" || return 1
+  done <"$snapshot_file"
+}
 restore_root_qdisc() {
   local iface=$1 kind=$2 spec=$3
   local -a arguments=()
   qdisc_is_restorable "$kind" || return 1
+  [[ $kind != mq ]] || { restore_mq_root_qdisc "$iface" "$spec"; return; }
   if [[ -n $spec ]]; then
     local IFS=' '
     read -r -a arguments <<<"$spec"
   fi
   tc qdisc replace dev "$iface" root "$kind" "${arguments[@]}"
+}
+remove_qdisc_snapshot() {
+  [[ ${1:-} == "$STATE_DIR"/qdisc-before-shape.* || ${1:-} == "$STATE_DIR"/qdisc-scan.* ]] && rm -f -- "$1"
 }
 write_shape_service() {
   local iface=$1 rate=$2 original=$3 original_spec=$4
@@ -458,12 +503,15 @@ EOF
 apply_shape() { tc qdisc replace dev "$1" root handle 1: htb default 10; tc class replace dev "$1" parent 1: classid 1:10 htb rate "${2}mbit" ceil "${2}mbit"; tc qdisc replace dev "$1" parent 1:10 handle 10: fq; }
 shape() {
   require_root; require_linux; require_command tc; require_command systemctl; lock; validate_common; is_positive_integer "$SHAPE_RATE" || fail 'shape 需要 --shape-rate 正整数。'; (( SHAPE_RATE <= 100000 )) || fail '--shape-rate 不能超过 100000 Mbit/s。'
-  local iface original original_spec snapshot
+  local iface original original_spec snapshot qdisc_backup
+  (( ENABLE_SHAPING )) || fail '整形必须显式加入 --enable-shaping。'
   iface=$(default_interface); [[ -n $iface ]] || fail '未检测到默认出口网卡。'
-  snapshot=$(qdisc_snapshot "$iface") || fail '当前根 qdisc 无法精确重建；为避免破坏多队列或特殊配置，拒绝整形。'
+  install -d -m 700 "$STATE_DIR"; qdisc_backup=$(mktemp "$STATE_DIR/qdisc-before-shape.XXXXXX")
+  snapshot=$(qdisc_snapshot "$iface" "$qdisc_backup") || { rm -f -- "$qdisc_backup"; fail '当前根 qdisc 无法精确重建；为避免破坏多队列或特殊配置，拒绝整形。'; }
   IFS=$'\t' read -r original original_spec <<<"$snapshot"
-  line; warn "整形将暂时替换 $iface 的活动根 qdisc=$original，可能短暂影响连接。"; say "已保存根队列参数：${original_spec:-默认参数}"; say "目标速率：${SHAPE_RATE} Mbit/s；叶子队列：FQ；重启后由 systemd 恢复。"; (( ENABLE_SHAPING )) || fail '整形必须显式加入 --enable-shaping。'
-  (( DRY_RUN )) && { ok '整形预览完成，未修改系统。'; return 0; }; confirm '确认应用 HTB + FQ 出向整形吗？' || { say '已取消。'; return 0; }; write_shape_service "$iface" "$SHAPE_RATE" "$original" "$original_spec"
+  [[ $original == mq ]] || rm -f -- "$qdisc_backup"
+  line; warn "整形将暂时替换 $iface 的活动根 qdisc=$original，可能短暂影响连接。"; [[ $original == mq ]] && say '已保存 mq 的每个可恢复叶子 qdisc 参数。' || say "已保存根队列参数：${original_spec:-默认参数}"; say "目标速率：${SHAPE_RATE} Mbit/s；叶子队列：FQ；重启后由 systemd 恢复。"
+  (( DRY_RUN )) && { remove_qdisc_snapshot "$qdisc_backup"; ok '整形预览完成，未修改系统。'; return 0; }; confirm '确认应用 HTB + FQ 出向整形吗？' || { remove_qdisc_snapshot "$qdisc_backup"; say '已取消。'; return 0; }; write_shape_service "$iface" "$SHAPE_RATE" "$original" "$original_spec"
   if ! apply_shape "$iface" "$SHAPE_RATE"; then
     warn '应用整形失败，正在移除本工具创建的持久化整形文件。'
     ASSUME_YES=1; unshape || true
@@ -477,56 +525,77 @@ unshape() {
   (( DRY_RUN )) && { say "将恢复 $iface 的根 qdisc 为 $original。"; return 0; }; confirm "移除 ${rate}Mbit 整形并恢复 $original 吗？" || { say '已取消。'; return 0; }
   systemctl disable --now vps-tcp-safe-tuner-qdisc.service >/dev/null 2>&1 || true; rm -f "$SHAPE_UNIT" "$SHAPE_SCRIPT"; systemctl daemon-reload
   restore_root_qdisc "$iface" "$original" "$original_spec" || fail '恢复根 qdisc 参数失败；整形状态文件已保留，可检查后重试。'
-  rm -f "$SHAPE_STATE"; ok '已移除本工具整形并恢复根 qdisc 参数。'
+  remove_qdisc_snapshot "$original_spec"; rm -f "$SHAPE_STATE"; ok '已移除本工具整形并恢复根 qdisc 参数。'
+}
+policer_candidate_is_clean() {
+  local rate=$1 retrans=$2 target_rate=$3 baseline_retrans=$4 allowed_retrans
+  allowed_retrans=$(( baseline_retrans / 4 + 10 ))
+  (( retrans <= allowed_retrans && rate * 100 >= target_rate * 90 ))
+}
+probe_shaper_candidate() {
+  local iface=$1 original=$2 original_spec=$3 candidate_rate=$4 baseline_retrans=$5
+  apply_shape "$iface" "$candidate_rate" || return 2
+  if ! measure; then
+    restore_root_qdisc "$iface" "$original" "$original_spec" || return 2
+    return 2
+  fi
+  restore_root_qdisc "$iface" "$original" "$original_spec" || return 2
+  say "扫描 ${candidate_rate}Mbit：中位吞吐 ${MEASURE_RATE}Mbit，累计重传 ${MEASURE_RETRANS}。"
+  policer_candidate_is_clean "$MEASURE_RATE" "$MEASURE_RETRANS" "$candidate_rate" "$baseline_retrans"
 }
 scan_shaper_candidate() {
   validate_peer; ensure_iperf3; require_command tc
-  local nominal candidate rate retrans best='' last_clean='' broke_at='' iface original original_spec snapshot saved_rounds
-  local -a coarse=(102 108 114 120 126)
+  local nominal candidate best='' last_clean='' broke_at='' iface original original_spec snapshot saved_rounds baseline_retrans qdisc_backup probe_status safe_rate
+  local -a coarse=(85 92 99 106 114 123 133 145)
   iface=$(default_interface); [[ -n $iface ]] || fail '未检测到默认出口网卡。'
-  snapshot=$(qdisc_snapshot "$iface") || fail '当前根 qdisc 无法精确重建，拒绝扫描整形。'
+  install -d -m 700 "$STATE_DIR"; qdisc_backup=$(mktemp "$STATE_DIR/qdisc-scan.XXXXXX")
+  snapshot=$(qdisc_snapshot "$iface" "$qdisc_backup") || { rm -f -- "$qdisc_backup"; fail '当前根 qdisc 无法精确重建，拒绝扫描整形。'; }
   IFS=$'\t' read -r original original_spec <<<"$snapshot"
+  [[ $original == mq ]] || rm -f -- "$qdisc_backup"
   nominal=$BANDWIDTH_MBIT
-  say "开始限速器拐点扫描：以 ${nominal}Mbit 基线向上粗扫，再在相邻区间细扫。"
-  say '每个候选都会临时使用 HTB+FQ，并在测试结束后恢复原 qdisc 参数。'
-  confirm "扫描会暂时替换 $iface 的根 qdisc，预计消耗较多流量。继续吗？" || { say '已跳过扫描。'; return 0; }
-  saved_rounds=$ROUNDS; ROUNDS=2
-  trap 'restore_root_qdisc "$iface" "$original" "$original_spec" >/dev/null 2>&1 || true; ROUNDS=$saved_rounds; exit 130' INT TERM HUP
+  baseline_retrans=${MEASURE_RETRANS:-0}
+  say "开始限速器拐点扫描：以 ${nominal}Mbit 基线从 85% 到 145% 自适应粗扫。"
+  say "每个候选使用 ${POLICER_ROUNDS} 轮测试；判定会同时参考基线重传噪声和送达率。"
+  say '发现拐点后使用二分法精扫；每轮临时 HTB+FQ 后都会恢复原 qdisc。'
+  confirm "扫描会暂时替换 $iface 的根 qdisc，预计消耗较多流量。继续吗？" || { remove_qdisc_snapshot "$qdisc_backup"; say '已跳过扫描。'; return 0; }
+  saved_rounds=$ROUNDS; ROUNDS=$POLICER_ROUNDS
+  trap 'restore_root_qdisc "$iface" "$original" "$original_spec" >/dev/null 2>&1 || true; remove_qdisc_snapshot "$qdisc_backup"; ROUNDS=$saved_rounds' EXIT
+  trap 'exit 130' INT TERM HUP
   for candidate in "${coarse[@]}"; do
     SHAPE_RATE=$(( nominal * candidate / 100 ))
-    apply_shape "$iface" "$SHAPE_RATE" || { restore_root_qdisc "$iface" "$original" "$original_spec" || true; ROUNDS=$saved_rounds; fail '扫描整形应用失败，已尝试恢复根队列。'; }
-    if ! measure; then
-      restore_root_qdisc "$iface" "$original" "$original_spec" || true
-      continue
-    fi
-    restore_root_qdisc "$iface" "$original" "$original_spec" || { ROUNDS=$saved_rounds; fail '扫描后恢复根 qdisc 参数失败，已停止。'; }
-    rate=$MEASURE_RATE; retrans=$MEASURE_RETRANS
-    say "粗扫 ${SHAPE_RATE}Mbit：中位吞吐 ${rate}Mbit，累计重传 ${retrans}。"
-    if (( retrans <= 10 && rate * 100 >= SHAPE_RATE * 85 )); then
+    if probe_shaper_candidate "$iface" "$original" "$original_spec" "$SHAPE_RATE" "$baseline_retrans"; then
       last_clean=$SHAPE_RATE; best=$SHAPE_RATE
     else
+      probe_status=$?
+      (( probe_status == 1 )) || fail '扫描整形应用或恢复失败，已触发 qdisc 恢复保护。'
       broke_at=$SHAPE_RATE
       break
     fi
   done
   if [[ -n $last_clean && -n $broke_at ]]; then
-    for ((candidate = last_clean + 1; candidate < broke_at; candidate += 1)); do
-      SHAPE_RATE=$candidate
-      apply_shape "$iface" "$SHAPE_RATE" || { restore_root_qdisc "$iface" "$original" "$original_spec" || true; ROUNDS=$saved_rounds; fail '细扫整形应用失败，已尝试恢复根队列。'; }
-      if ! measure; then
-        restore_root_qdisc "$iface" "$original" "$original_spec" || true
-        continue
+    say "拐点区间：${last_clean} 到 ${broke_at} Mbit，开始二分精扫。"
+    while (( broke_at - last_clean > 1 )); do
+      candidate=$(( (last_clean + broke_at) / 2 ))
+      if probe_shaper_candidate "$iface" "$original" "$original_spec" "$candidate" "$baseline_retrans"; then
+        last_clean=$candidate; best=$candidate
+      else
+        probe_status=$?
+        (( probe_status == 1 )) || fail '二分精扫应用或恢复失败，已触发 qdisc 恢复保护。'
+        broke_at=$candidate
       fi
-      restore_root_qdisc "$iface" "$original" "$original_spec" || { ROUNDS=$saved_rounds; fail '细扫后恢复根 qdisc 参数失败，已停止。'; }
-      rate=$MEASURE_RATE; retrans=$MEASURE_RETRANS
-      say "细扫 ${SHAPE_RATE}Mbit：中位吞吐 ${rate}Mbit，累计重传 ${retrans}。"
-      if (( retrans <= 10 && rate * 100 >= SHAPE_RATE * 85 )); then best=$SHAPE_RATE; else break; fi
     done
   fi
   ROUNDS=$saved_rounds
   restore_root_qdisc "$iface" "$original" "$original_spec" || fail '扫描结束时恢复根 qdisc 参数失败，请立即检查网络状态。'
-  trap - INT TERM HUP
-  [[ -n $best ]] && say "建议整形速率：${best} Mbit/s；请用 shape --shape-rate ${best} --enable-shaping 后再 verify。" || warn '未得到可信整形候选；不要盲目整形。'
+  trap - EXIT INT TERM HUP
+  remove_qdisc_snapshot "$qdisc_backup"
+  if [[ -n $best && -n $broke_at ]]; then
+    safe_rate=$(( best * 97 / 100 )); (( safe_rate < 1 )) && safe_rate=1
+    say "建议整形速率：${safe_rate} Mbit/s（拐点前 ${best}Mbit 留出 3% 余量）。"
+    say "请用 shape --shape-rate ${safe_rate} --enable-shaping 后再 verify。"
+  else
+    warn '扫描范围内没有确认的限速器拐点，不建议盲目整形。'
+  fi
 }
 auto() {
   local baseline_rate baseline_retrans after_rate after_retrans decision
@@ -596,7 +665,7 @@ menu() {
 }
 parse_options() {
   while (($#)); do case "$1" in
-    --peer) PEER=${2:-}; shift 2 ;; --port) PEER_PORT=${2:-}; shift 2 ;; --role) ROLE=${2:-}; shift 2 ;; --bandwidth) BANDWIDTH_MBIT=${2:-}; shift 2 ;; --rtt) RTT_MS=${2:-}; shift 2 ;; --duration) DURATION=${2:-}; shift 2 ;; --workers) WORKERS=${2:-}; shift 2 ;; --rounds) ROUNDS=${2:-}; shift 2 ;; --shape-rate) SHAPE_RATE=${2:-}; shift 2 ;;
+    --peer) PEER=${2:-}; shift 2 ;; --port) PEER_PORT=${2:-}; shift 2 ;; --role) ROLE=${2:-}; shift 2 ;; --bandwidth) BANDWIDTH_MBIT=${2:-}; shift 2 ;; --rtt) RTT_MS=${2:-}; shift 2 ;; --duration) DURATION=${2:-}; shift 2 ;; --workers) WORKERS=${2:-}; shift 2 ;; --rounds) ROUNDS=${2:-}; shift 2 ;; --policer-rounds) POLICER_ROUNDS=${2:-}; shift 2 ;; --shape-rate) SHAPE_RATE=${2:-}; shift 2 ;;
     --enable-shaping) ENABLE_SHAPING=1; shift ;; --search-buffers) BUFFER_SEARCH=1; shift ;; --dry-run) DRY_RUN=1; shift ;; --yes) ASSUME_YES=1; shift ;; --no-install) NO_INSTALL=1; shift ;; --keep-on-regression) KEEP_ON_REGRESSION=1; shift ;; -h|--help) usage; exit 0 ;; *) fail "未知选项：$1" ;;
   esac; done
 }

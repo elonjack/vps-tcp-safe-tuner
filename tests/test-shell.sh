@@ -21,10 +21,26 @@ assert_equals 3 "$MEASURE_RETRANS" 'iperf3 重传解析'
 
 tc() {
   if [[ $1 == qdisc && $2 == show ]]; then
-    printf '%s\n' 'qdisc fq_codel 0: root refcnt 2 limit 2048p flows 512 target 5.0ms interval 100.0ms ecn'
+    if [[ ${TC_FIXTURE:-single} == mq ]]; then
+      printf '%s\n' 'qdisc mq 0: root'
+      printf '%s\n' 'qdisc fq 0: parent :1 limit 10000p pacing'
+      printf '%s\n' 'qdisc fq_codel 0: parent :2 limit 2048p flows 512 target 5.0ms interval 100.0ms ecn'
+    else
+      printf '%s\n' 'qdisc fq_codel 0: root refcnt 2 limit 2048p flows 512 target 5.0ms interval 100.0ms ecn'
+    fi
   fi
 }
 snapshot=$(qdisc_snapshot eth0)
 assert_equals $'fq_codel\tlimit 2048p flows 512 target 5.0ms interval 100.0ms ecn' "$snapshot" 'qdisc 参数快照'
+
+TC_FIXTURE=mq
+mq_snapshot=$(mktemp)
+snapshot=$(qdisc_snapshot eth0 "$mq_snapshot")
+assert_equals $'mq\t'"$mq_snapshot" "$snapshot" 'mq 根队列快照'
+assert_equals $'fq\t:1\tlimit 10000p pacing\nfq_codel\t:2\tlimit 2048p flows 512 target 5.0ms interval 100.0ms ecn' "$(cat "$mq_snapshot")" 'mq 叶子队列参数快照'
+rm -f "$mq_snapshot"
+
+policer_candidate_is_clean 950 8 1000 0 || { printf '限速器干净候选判断失败。\n' >&2; exit 1; }
+if policer_candidate_is_clean 800 0 1000 0; then printf '限速器送达率判断失败。\n' >&2; exit 1; fi
 
 printf 'Shell 功能测试通过。\n'

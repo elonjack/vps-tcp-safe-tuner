@@ -13,7 +13,8 @@
 | 自适应 BDP | 使用实测带宽和 RTT，按用途与内存限制推导 TCP 缓冲区 |
 | 缓冲区 A/B 搜索 | 可选比较 1×、2×、3× BDP 缓冲区，保留吞吐最高且重传可接受的候选 |
 | TCP 调优 | BBR、FQ 默认队列、收发缓冲区、MTU 探测、慢启动、backlog 与连接队列 |
-| 限速器处理 | 可选、明确确认的 HTB + FQ 整形；以基线向上粗扫、拐点区间细扫、两轮复测候选 |
+| 限速器处理 | 可选、明确确认的 HTB + FQ 整形；基线噪声感知的 85%–145% 粗扫、三轮复测、二分精扫与安全余量建议 |
+| 多队列恢复 | 保存常见单根 qdisc 参数；对常见 `mq` 多队列根同时保存每个可恢复叶子队列并逐个恢复 |
 | 性能保护 | 调优前后使用相同对端复测；吞吐明显退化或重传明显增加时默认自动回滚 |
 | 持久化与回滚 | 专属 sysctl/systemd 文件；首次变更前保存精确 sysctl 快照与实验报告 |
 
@@ -23,7 +24,7 @@
 - iperf3 缺失时才会询问是否安装系统包；绝不运行 `apt update`。
 - 默认不触碰正在运行的根 qdisc；整形必须额外使用 `--enable-shaping` 并确认。
 - 只接受域名或 IPv4 形式的对端，所有参数有范围校验。
-- 受限 OpenVZ/LXC、特殊 `mq` 根队列、无法精确重建的 qdisc 会被拒绝；支持的 `fq`、`fq_codel`、`pfifo*` 会保存根队列参数后恢复。
+- 受限 OpenVZ/LXC、无法精确重建的自定义 qdisc 会被拒绝；支持的 `fq`、`fq_codel`、`pfifo*` 会保存参数后恢复，常见 `mq` 多队列会额外保存并恢复每个受支持的叶子队列。
 - 终端提示为黄色；重定向日志时自动移除 ANSI 颜色。
 
 ## 支持范围
@@ -35,7 +36,7 @@
 一键安装固定版本。安装器会下载 GitHub Release 资产并在安装前校验 SHA-256：
 
 ```bash
-bash <(curl -fsSL https://raw.githubusercontent.com/elonjack/vps-tcp-safe-tuner/v3.2.0/install.sh)
+bash <(curl -fsSL https://raw.githubusercontent.com/elonjack/vps-tcp-safe-tuner/v3.3.0/install.sh)
 ```
 
 安装后可直接运行：
@@ -94,7 +95,9 @@ sudo ./vps-tcp-tune.sh apply --bandwidth 1000 --rtt 150 --role proxy
 
 ## 限速器与整形
 
-只有出口 policer 导致重传或吞吐不稳时，整形才可能改善代理/大流吞吐。启用 `--enable-shaping` 后，自动流程会以基线速率向上粗扫，遇到重传/吞吐拐点后在相邻区间逐 1 Mbit 细扫；每个候选均做两轮测试并在每轮后恢复原 qdisc。完成后只给出候选值，不会自动持久化整形。
+只有出口 policer 导致重传或吞吐不稳时，整形才可能改善代理/大流吞吐。启用 `--enable-shaping` 后，自动流程会从基线的 85% 到 145% 粗扫；每个候选默认独立测试 3 轮，并按基线重传噪声与至少 90% 的送达率共同判定。发现拐点后改用二分法精扫，在最佳候选下方保留 3% 余量。完成后只给出建议，不会自动持久化整形。
+
+可用 `--policer-rounds 2` 到 `--policer-rounds 5` 调整每个候选的测试轮数；更多轮次更稳，但会消耗更多测试流量。扫描中无论正常结束、报错退出或收到中断，都会先恢复扫描前的根 qdisc；遇到自定义或无法逐叶恢复的多队列配置时，脚本会拒绝扫描。
 
 ```bash
 sudo ./vps-tcp-tune.sh shape --shape-rate 950 --enable-shaping
