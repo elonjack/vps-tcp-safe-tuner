@@ -30,18 +30,47 @@
 
 ## 快速开始
 
+一键安装固定版本。安装器会下载 GitHub Release 资产并在安装前校验 SHA-256：
+
+```bash
+bash <(curl -fsSL https://raw.githubusercontent.com/elonjack/vps-tcp-safe-tuner/v2.0.0/install.sh)
+```
+
+安装后可直接运行：
+
+```bash
+sudo vps-tcp-tune audit
+sudo vps-tcp-tune
+```
+
+也可下载仓库中的脚本后手动执行：
+
 ```bash
 chmod 755 vps-tcp-tune.sh
 sudo ./vps-tcp-tune.sh audit
 ```
 
-推荐准备一台自有或可信的 iperf3 服务端：
+直接一键调优时无需你另买 VPS：省略 `--peer` 后，脚本会从内置公共 iperf3 节点中按 RTT 自动选择可用对端。公共节点可能满载或临时不可用；这种情况下可稍后重试，或指定你自己的可信对端以获得更稳定的结果。
+
+最简单的一键调优：
+
+```bash
+sudo vps-tcp-tune
+```
+
+也可以明确使用自动公共节点：
+
+```bash
+sudo vps-tcp-tune auto --role proxy
+```
+
+若需最可重复、最贴近业务目标的测量，推荐准备一台自有或可信的 iperf3 服务端：
 
 ```bash
 iperf3 -s
 ```
 
-在 VPS 客户端进行自适应调优：
+指定对端的自适应调优：
 
 ```bash
 sudo ./vps-tcp-tune.sh auto --peer YOUR_IPERF3_HOST --role proxy

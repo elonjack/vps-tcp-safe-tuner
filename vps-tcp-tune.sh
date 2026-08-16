@@ -20,6 +20,24 @@ readonly MARKER='# Managed by vps-tcp-safe-tuner. Remove only with vps-tcp-tune 
 COMMAND='menu'; ROLE='general'; PEER=''; PEER_PORT='5201'; BANDWIDTH_MBIT=''; RTT_MS=''
 DURATION='12'; WORKERS='4'; SHAPE_RATE=''; ENABLE_SHAPING=0; DRY_RUN=0; ASSUME_YES=0; NO_INSTALL=0
 
+# 第三方公开 iperf3 节点。自动模式会按 RTT 排序、依次做短测试；用户也可用 --peer 覆盖。
+# 节点可用性会变化，因此自动选择失败时会给出明确提示，不会伪造测量结果。
+readonly PUBLIC_PEERS='
+speedtest.hkg12.hk.leaseweb.net|香港|Leaseweb
+speedtest.sin1.sg.leaseweb.net|新加坡|Leaseweb
+sgp.proof.ovh.net|新加坡|OVH
+speedtest.tyo11.jp.leaseweb.net|东京|Leaseweb
+speedtest.fra1.de.leaseweb.net|法兰克福|Leaseweb
+speedtest.ams2.nl.leaseweb.net|阿姆斯特丹|Leaseweb
+speedtest.lon12.uk.leaseweb.net|伦敦|Leaseweb
+speedtest.lax12.us.leaseweb.net|洛杉矶|Leaseweb
+speedtest.sfo12.us.leaseweb.net|旧金山|Leaseweb
+speedtest.sea11.us.leaseweb.net|西雅图|Leaseweb
+speedtest.dal13.us.leaseweb.net|达拉斯|Leaseweb
+speedtest.chi11.us.leaseweb.net|芝加哥|Leaseweb
+speedtest.nyc1.us.leaseweb.net|纽约|Leaseweb
+speedtest.mtl2.ca.leaseweb.net|蒙特利尔|Leaseweb'
+
 yellow() { if [[ -t 1 ]]; then printf '\033[1;33m%s\033[0m' "$*"; else printf '%s' "$*"; fi; }
 say() { yellow "[信息] $*"; printf '\n'; }
 warn() { yellow "[警告] $*" >&2; printf '\n' >&2; }
@@ -44,7 +62,7 @@ vps-tcp-tune - 自适应 Linux VPS TCP 调优工具
   rollback                     还原本工具管理的 sysctl 与整形
 
 通用选项：
-  --peer HOST          iperf3 对端域名或 IPv4 地址（推荐自有/可信对端）
+  --peer HOST          iperf3 对端域名或 IPv4 地址；省略时自动选择公共节点
   --port PORT          对端端口，默认 5201
   --role general|proxy|server  用途影响队列和端口范围策略，默认 general
   --bandwidth MBIT     标称或实测出口带宽（Mbit/s）
@@ -108,7 +126,37 @@ validate_common() {
   [[ -z $BANDWIDTH_MBIT ]] || { is_positive_integer "$BANDWIDTH_MBIT" && (( BANDWIDTH_MBIT <= 100000 )) || fail '--bandwidth 必须是 1 到 100000 的整数。'; }
   [[ -z $RTT_MS ]] || { is_positive_integer "$RTT_MS" && (( RTT_MS <= 3000 )) || fail '--rtt 必须是 1 到 3000 的整数。'; }
 }
-validate_peer() { [[ -n $PEER ]] || fail '需要 --peer；请使用自有或可信 iperf3 服务端。'; [[ $PEER =~ ^[A-Za-z0-9._-]+$ ]] || fail '--peer 仅允许域名或 IPv4 地址；IPv6 请用 DNS 名称。'; }
+validate_peer() { [[ -n $PEER ]] || fail '未取得可用 iperf3 对端。'; [[ $PEER =~ ^[A-Za-z0-9._-]+$ ]] || fail '--peer 仅允许域名或 IPv4 地址；IPv6 请用 DNS 名称。'; }
+
+auto_pick_peer() {
+  local candidate location provider rtt ranked host port probe
+  local -a ports=(5201 5202 5203 5204 5205 5206 5207 5208 5209 5210 5200)
+  say '未指定 --peer，正在从内置公共 iperf3 节点中自动选择可用且 RTT 较低的对端。'
+  ranked=''
+  while IFS='|' read -r candidate location provider; do
+    [[ -n $candidate ]] || continue
+    rtt='9999'
+    if command -v ping >/dev/null 2>&1; then
+      rtt=$(ping -n -c 2 -W 2 "$candidate" 2>/dev/null | awk -F'/' '/min\/avg\/max|round-trip/ {printf "%.0f", $5}' | tail -n 1 || true)
+      [[ -n $rtt ]] || rtt='9999'
+    fi
+    ranked+="$rtt|$candidate|$location|$provider"$'\n'
+  done <<<"$PUBLIC_PEERS"
+  while IFS='|' read -r rtt host location provider; do
+    [[ -n $host ]] || continue
+    (( rtt <= 250 )) || continue
+    say "尝试公共节点：$location / $provider（RTT 约 ${rtt}ms）。"
+    for port in "${ports[@]}"; do
+      probe=$(timeout 12 iperf3 -c "$host" -p "$port" -P 1 -t 3 --omit 1 2>&1) || continue
+      if [[ $probe == *'receiver'* ]]; then
+        PEER=$host; PEER_PORT=$port
+        ok "已选择公共对端：$PEER:$PEER_PORT（$location / $provider）。"
+        return 0
+      fi
+    done
+  done < <(printf '%s' "$ranked" | sort -n -t '|' -k 1,1)
+  fail '未找到可用公共 iperf3 对端。请稍后重试，或使用 --peer 指定自有/可信对端。'
+}
 
 ensure_iperf3() {
   command -v iperf3 >/dev/null 2>&1 && return 0
@@ -142,7 +190,9 @@ parse_iperf_result() {
   MEASURE_RETRANS=$(awk '$NF == "sender" {value=$(NF-1)} END{if(value!="")print value;else print 0}' <<<"$output")
 }
 measure() {
-  require_linux; require_command timeout; validate_common; validate_peer; ensure_iperf3
+  require_linux; require_command timeout; validate_common; ensure_iperf3
+  [[ -n $PEER ]] || auto_pick_peer
+  validate_peer
   say "开始测试：对端=$PEER:$PEER_PORT，并发=$WORKERS，时长=${DURATION}s。"
   say '测试会产生实际流量；请确认套餐流量充足。'
   MEASURE_OUTPUT=$(timeout "$(( DURATION + 15 ))" iperf3 -c "$PEER" -p "$PEER_PORT" -P "$WORKERS" -t "$DURATION" --omit 2 2>&1) || { yellow "$MEASURE_OUTPUT"; printf '\n'; fail 'iperf3 测试失败；请检查对端、端口、防火墙和出口连通性。'; }
@@ -290,7 +340,7 @@ scan_shaper_candidate() {
   [[ -n $best ]] && say "建议整形速率候选：${best} Mbit/s；请比较 verify 后再手动执行 shape。" || warn '未得到零重传候选；不要盲目整形。'
 }
 auto() {
-  require_root; require_linux; validate_common; validate_peer; measure; BANDWIDTH_MBIT=$MEASURE_RATE; [[ -n $MEASURE_RTT ]] && RTT_MS=$MEASURE_RTT; derive_network_facts; apply_tuning; say '正在执行调优后验证。'; measure
+  require_root; require_linux; validate_common; measure; BANDWIDTH_MBIT=$MEASURE_RATE; [[ -n $MEASURE_RTT ]] && RTT_MS=$MEASURE_RTT; derive_network_facts; apply_tuning; say '正在执行调优后验证。'; measure
   if (( ENABLE_SHAPING )); then
     if [[ $MEASURE_RETRANS == 0 ]]; then say '验证无重传，跳过限速器扫描。';
     else warn '已启用限速器候选扫描。扫描只给出建议，不会持久化整形。'; scan_shaper_candidate; fi
@@ -318,7 +368,7 @@ menu() {
   require_linux; line; say "VPS TCP 自适应调优器 v$VERSION"; line; yellow "1) 自适应测试并调优（需要可信 iperf3 对端）\n2) 按已知带宽/RTT 调优\n3) 仅检测\n4) 查看状态\n5) 回滚\n0) 退出\n"
   local choice; yellow '[选择] '; read -r choice
   case "$choice" in
-    1) yellow '[对端域名或 IPv4] '; read -r PEER; yellow '[用途 general/proxy/server，默认 general] '; read -r ROLE; ROLE=${ROLE:-general}; auto ;;
+    1) yellow '[对端域名或 IPv4，回车自动选择公共节点] '; read -r PEER; yellow '[用途 general/proxy/server，默认 general] '; read -r ROLE; ROLE=${ROLE:-general}; auto ;;
     2) yellow '[带宽 Mbit] '; read -r BANDWIDTH_MBIT; yellow '[典型 RTT ms] '; read -r RTT_MS; yellow '[用途 general/proxy/server，默认 general] '; read -r ROLE; ROLE=${ROLE:-general}; apply_tuning ;;
     3) audit ;; 4) status ;; 5) rollback ;; 0) say '已退出。' ;; *) fail '无效选择。' ;;
   esac
