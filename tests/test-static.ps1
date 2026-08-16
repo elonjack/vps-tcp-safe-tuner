@@ -11,5 +11,7 @@ if ($content -notmatch 'qdisc\.tsv') { throw 'Missing qdisc state tracking.' }
 if ($content -notmatch 'ENABLE_SHAPING=0') { throw 'Shaping must default to disabled.' }
 if ($content -notmatch 'qdisc_is_restorable') { throw 'Root qdisc must be checked for restorability.' }
 if ($content -notmatch 'restore_snapshot_values') { throw 'Missing rollback implementation.' }
+if ($content -notmatch 'ensure_bbr') { throw 'Missing automatic BBR loading.' }
+if ($content -notmatch 'BBR_MODULE_MARKER') { throw 'Missing managed BBR persistence marker.' }
 
 Write-Host 'Static security checks passed.'

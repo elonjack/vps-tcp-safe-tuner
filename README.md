@@ -36,10 +36,10 @@
 一键安装固定版本。安装器会下载 GitHub Release 资产并在安装前校验 SHA-256：
 
 ```bash
-bash <(curl -fsSL https://raw.githubusercontent.com/elonjack/vps-tcp-safe-tuner/v3.3.2/install.sh)
+bash <(curl -fsSL https://raw.githubusercontent.com/elonjack/vps-tcp-safe-tuner/v3.4.0/install.sh)
 ```
 
-安装后可直接运行：
+在交互终端中，安装完成会自动打开中文菜单；选择 1 即可完成测量、自动加载内核已有的 BBR、应用与复测。也可之后手动运行：
 
 ```bash
 sudo vps-tcp-tune audit
@@ -79,7 +79,7 @@ iperf3 -s
 sudo ./vps-tcp-tune.sh auto --peer YOUR_IPERF3_HOST --role proxy
 ```
 
-该流程会先记录 3 轮基准、显示推导参数、确认后应用，再以同一对端复测 3 轮。若吞吐下降超过 15%，或原本零重传而复测累计出现超过 10 次重传，默认自动回滚。测速会消耗流量，默认每轮为 4 流、12 秒；可用 `--rounds 1` 到 `--rounds 5` 调整。
+该流程会先记录 3 轮基准、显示推导参数、确认后自动尝试 `modprobe tcp_bbr`，并以本工具专属配置让 BBR 在重启后加载，再应用参数并以同一对端复测 3 轮。若内核确实没有 BBR 模块，工具会停止而不会下载模块或更换内核。若吞吐下降超过 15%，或原本零重传而复测累计出现超过 10 次重传，默认自动回滚。测速会消耗流量，默认每轮为 4 流、12 秒；可用 `--rounds 1` 到 `--rounds 5` 调整。
 
 如需进一步针对当前线路搜索缓冲区上限，可显式启用 A/B 搜索。该模式会额外进行 3 组、每组 2 轮测试，因此仅建议在流量充足且业务低峰时使用：
 

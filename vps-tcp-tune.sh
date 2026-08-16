@@ -6,7 +6,7 @@ set -Eeuo pipefail
 IFS=$'\n\t'
 umask 077
 
-readonly VERSION='3.3.2'
+readonly VERSION='3.4.0'
 readonly STATE_DIR='/var/lib/vps-tcp-safe-tuner'
 readonly SNAPSHOT_FILE="$STATE_DIR/baseline.tsv"
 readonly FACTS_FILE="$STATE_DIR/facts.tsv"
@@ -15,8 +15,10 @@ readonly LOCK_FILE='/run/lock/vps-tcp-safe-tuner.lock'
 readonly SHAPE_SCRIPT='/usr/local/sbin/vps-tcp-safe-tuner-qdisc'
 readonly SHAPE_UNIT='/etc/systemd/system/vps-tcp-safe-tuner-qdisc.service'
 readonly SHAPE_STATE="$STATE_DIR/qdisc.tsv"
+readonly BBR_MODULE_FILE='/etc/modules-load.d/vps-tcp-safe-tuner-bbr.conf'
 readonly REPORT_DIR='/var/log/vps-tcp-safe-tuner'
 readonly MARKER='# Managed by vps-tcp-safe-tuner. Remove only with vps-tcp-tune rollback.'
+readonly BBR_MODULE_MARKER='# Managed by vps-tcp-safe-tuner: load BBR at boot.'
 
 COMMAND='menu'; ROLE='general'; PEER=''; PEER_PORT='5201'; BANDWIDTH_MBIT=''; RTT_MS=''
 DURATION='12'; WORKERS='4'; ROUNDS='3'; POLICER_ROUNDS='3'; PEER_MAX_RTT='120'; BUFFER_MULTIPLIER_OVERRIDE=''; SHAPE_RATE=''; ENABLE_SHAPING=0; BUFFER_SEARCH=0; DRY_RUN=0; ASSUME_YES=0; NO_INSTALL=0; KEEP_ON_REGRESSION=0
@@ -126,6 +128,33 @@ sysctl_exists() {
   [[ $'\n'$names$'\n' == *$'\n'"$1"$'\n'* ]]
 }
 kernel_supports_bbr() { [[ " $(sysctl_value net.ipv4.tcp_available_congestion_control) " == *' bbr '* ]]; }
+write_bbr_module_config() {
+  local temporary_file
+  if [[ -e $BBR_MODULE_FILE ]] && ! grep -Fqx "$BBR_MODULE_MARKER" "$BBR_MODULE_FILE"; then
+    warn "BBR 已临时加载；拒绝覆盖非本工具模块配置：$BBR_MODULE_FILE。"
+    return 1
+  fi
+  [[ -d $(dirname "$BBR_MODULE_FILE") ]] || mkdir -p -m 755 "$(dirname "$BBR_MODULE_FILE")"
+  temporary_file=$(mktemp "${BBR_MODULE_FILE}.XXXXXX")
+  { printf '%s\n' "$BBR_MODULE_MARKER"; printf '%s\n' 'tcp_bbr'; } >"$temporary_file"
+  chmod 644 "$temporary_file"; mv -f "$temporary_file" "$BBR_MODULE_FILE"
+}
+remove_bbr_module_config() {
+  [[ -f $BBR_MODULE_FILE ]] && grep -Fqx "$BBR_MODULE_MARKER" "$BBR_MODULE_FILE" && rm -f "$BBR_MODULE_FILE"
+}
+ensure_bbr() {
+  kernel_supports_bbr && return 0
+  (( DRY_RUN )) && fail '预览模式不会加载 tcp_bbr；当前内核尚未提供 BBR。'
+  require_command modprobe
+  say '当前内核未列出 BBR，正在尝试加载已有 tcp_bbr 模块。'
+  modprobe tcp_bbr 2>/dev/null || fail '无法加载 tcp_bbr；商家内核可能未提供该模块，工具不会下载模块或替换内核。'
+  kernel_supports_bbr || fail 'tcp_bbr 已尝试加载，但内核仍未提供 BBR；已停止调优。'
+  if write_bbr_module_config; then
+    ok 'BBR 已启用；本工具会在重启后自动加载 tcp_bbr。'
+  else
+    warn 'BBR 已在本次启动中启用；因同名模块配置不归本工具管理，未改动其重启加载行为。'
+  fi
+}
 memory_mib() { awk '/MemTotal:/ {print int($2 / 1024)}' /proc/meminfo; }
 default_interface() { ip route show default 2>/dev/null | awk 'NR == 1 {for (i=1;i<=NF;i++) if ($i=="dev") {print $(i+1); exit}}'; }
 virtualization() { systemd-detect-virt 2>/dev/null || printf 'unknown'; }
@@ -278,7 +307,7 @@ declare -a KEYS=() VALUES=()
 add_setting() { sysctl_exists "$1" || { warn "内核不支持 $1，已跳过。"; return 0; }; KEYS+=("$1"); VALUES+=("$2"); }
 build_settings() {
   local buffer backlog socket_queue syn_queue
-  KEYS=(); VALUES=(); kernel_supports_bbr || fail '当前内核未提供 BBR；工具不会下载模块或替换内核。'
+  KEYS=(); VALUES=()
   buffer=$(calculate_buffer); backlog=$(calculate_backlog); case "$ROLE" in proxy|server) socket_queue=8192; syn_queue=8192 ;; *) socket_queue=4096; syn_queue=4096 ;; esac
   add_setting net.core.default_qdisc fq; add_setting net.ipv4.tcp_congestion_control bbr
   add_setting net.core.rmem_max "$buffer"; add_setting net.core.wmem_max "$buffer"
@@ -345,7 +374,7 @@ is_material_regression() {
 revert_auto_experiment() {
   warn '复测显示明显退化，正在恢复本次 TCP 参数。'
   restore_snapshot_values
-  rm -f "$CONFIG_FILE" "$FACTS_FILE" "$SNAPSHOT_FILE"
+  remove_bbr_module_config; rm -f "$CONFIG_FILE" "$FACTS_FILE" "$SNAPSHOT_FILE"
   rmdir "$STATE_DIR" 2>/dev/null || true
   ok '已自动回滚本次实验参数；实验报告仍保留。'
 }
@@ -367,11 +396,12 @@ apply_built_settings() {
 apply_tuning() {
   TUNING_APPLIED=0
   require_root; require_linux; require_command sysctl; require_command ip; require_command tc; lock; validate_common; derive_network_facts; build_settings; show_plan
-  (( DRY_RUN )) && { ok '预览完成，未修改系统。'; return 0; }; confirm '将写入 sysctl、保存精确快照并立即应用自适应 TCP 参数。继续吗？' || { say '已取消。'; return 0; }
+  (( DRY_RUN )) && { ok '预览完成，未修改系统。'; return 0; }; confirm '将自动启用内核已有的 BBR（如尚未加载）、写入 sysctl、保存精确快照并立即应用自适应 TCP 参数。继续吗？' || { say '已取消。'; return 0; }
+  ensure_bbr
   snapshot_if_needed
   if ! apply_built_settings; then
     warn '候选 sysctl 应用失败，正在恢复首次快照。'
-    restore_snapshot_values
+    restore_snapshot_values; remove_bbr_module_config
     fail '调优失败，已执行回滚。'
   fi
   write_config; write_facts; TUNING_APPLIED=1; ok "已应用 ${#KEYS[@]} 项自适应 TCP 设置。"
@@ -641,7 +671,7 @@ audit() {
   require_linux; require_command sysctl; require_command ip; show_environment
   if kernel_supports_bbr; then say 'BBR 可用：是'; else say 'BBR 可用：否'; fi
   say "sysctl 配置目录：$([[ -d /etc/sysctl.d ]] && echo 可用 || echo 缺失)"; say "iperf3：$(command -v iperf3 >/dev/null 2>&1 && echo 已安装 || echo 未安装)"; say "systemd：$(command -v systemctl >/dev/null 2>&1 && echo 可用 || echo 不可用)"
-  say '提示：OpenVZ/LXC 容器可能拒绝部分 sysctl 或 qdisc；脚本遇到拒绝会回滚。'
+  say '提示：选菜单 1 或 2 调优时，脚本会自动尝试加载内核已有的 tcp_bbr；OpenVZ/LXC 可能拒绝部分 sysctl 或 qdisc。'
 }
 status() {
   require_linux; require_command sysctl; show_environment
@@ -652,7 +682,7 @@ status() {
 rollback() {
   require_root; require_linux; require_command sysctl; lock; [[ -f $SNAPSHOT_FILE ]] || fail '未找到首次快照；拒绝猜测系统原始值。'
   (( DRY_RUN )) && { say '将恢复 sysctl 快照并移除本工具配置和整形。'; return 0; }; confirm '恢复首次 sysctl 快照并移除本工具的持久化配置/整形吗？' || { say '已取消。'; return 0; }
-  [[ -f $SHAPE_STATE ]] && { ASSUME_YES=1; unshape; }; restore_snapshot_values; rm -f "$CONFIG_FILE" "$SNAPSHOT_FILE" "$FACTS_FILE"; rmdir "$STATE_DIR" 2>/dev/null || true; ok '已恢复快照并清理本工具创建的持久化文件。'
+  [[ -f $SHAPE_STATE ]] && { ASSUME_YES=1; unshape; }; restore_snapshot_values; remove_bbr_module_config; rm -f "$CONFIG_FILE" "$SNAPSHOT_FILE" "$FACTS_FILE"; rmdir "$STATE_DIR" 2>/dev/null || true; ok '已恢复快照并清理本工具创建的持久化文件。'
 }
 menu() {
   require_linux; line; say "VPS TCP 自适应调优器 v$VERSION"; line
