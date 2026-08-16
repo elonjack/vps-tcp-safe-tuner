@@ -36,7 +36,7 @@
 一键安装固定版本。安装器会下载 GitHub Release 资产并在安装前校验 SHA-256：
 
 ```bash
-bash <(curl -fsSL https://raw.githubusercontent.com/elonjack/vps-tcp-safe-tuner/v3.4.0/install.sh)
+bash <(curl -fsSL https://raw.githubusercontent.com/elonjack/vps-tcp-safe-tuner/v3.4.1/install.sh)
 ```
 
 在交互终端中，安装完成会自动打开中文菜单；选择 1 即可完成测量、自动加载内核已有的 BBR、应用与复测。也可之后手动运行：

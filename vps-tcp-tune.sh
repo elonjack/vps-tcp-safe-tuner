@@ -6,7 +6,7 @@ set -Eeuo pipefail
 IFS=$'\n\t'
 umask 077
 
-readonly VERSION='3.4.0'
+readonly VERSION='3.4.1'
 readonly STATE_DIR='/var/lib/vps-tcp-safe-tuner'
 readonly SNAPSHOT_FILE="$STATE_DIR/baseline.tsv"
 readonly FACTS_FILE="$STATE_DIR/facts.tsv"
@@ -243,7 +243,7 @@ measure() {
   require_linux; require_command timeout; validate_common; ensure_iperf3
   [[ -n $PEER ]] || auto_pick_peer
   validate_peer
-  local temporary_file round valid required rate retrans median_index estimated_mb
+  local temporary_file round valid required rate retrans median_position estimated_mb
   temporary_file=$(mktemp)
   chmod 600 "$temporary_file"
   valid=0
@@ -268,8 +268,8 @@ measure() {
     rm -f "$temporary_file"
     fail "仅 $valid/$ROUNDS 轮测试有效，少于所需的 $required 轮；拒绝据此调优。"
   fi
-  median_index=$(( (valid + 1) / 2 ))
-  MEASURE_RATE=$(sort -n -k 1,1 "$temporary_file" | awk -v index="$median_index" 'NR == index {print $1}')
+  median_position=$(( (valid + 1) / 2 ))
+  MEASURE_RATE=$(sort -n -k 1,1 "$temporary_file" | awk -v position="$median_position" 'NR == position {print $1}')
   MEASURE_RETRANS=$(awk -F'\t' '{total += $2} END {printf "%.0f", total}' "$temporary_file")
   estimated_mb=$(awk -v rate="$MEASURE_RATE" -v seconds="$DURATION" -v count="$valid" 'BEGIN {printf "%.0f", rate * seconds * count / 8}')
   rm -f "$temporary_file"

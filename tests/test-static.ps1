@@ -13,5 +13,6 @@ if ($content -notmatch 'qdisc_is_restorable') { throw 'Root qdisc must be checke
 if ($content -notmatch 'restore_snapshot_values') { throw 'Missing rollback implementation.' }
 if ($content -notmatch 'ensure_bbr') { throw 'Missing automatic BBR loading.' }
 if ($content -notmatch 'BBR_MODULE_MARKER') { throw 'Missing managed BBR persistence marker.' }
+if ($content -match 'awk\s+-v\s+index=') { throw 'Do not shadow the awk index() builtin.' }
 
 Write-Host 'Static security checks passed.'
