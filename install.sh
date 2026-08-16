@@ -4,7 +4,7 @@ set -Eeuo pipefail
 
 readonly VERSION='3.5.0'
 readonly REPOSITORY='elonjack/vps-tcp-safe-tuner'
-readonly EXPECTED_SHA256='e371b19aa52154db24e587dc45613ce748ab37d2ab5288a35005d5e66e2d9b3a'
+readonly EXPECTED_SHA256='8f34799937bc32308d47b5e1f13a243bb1c223e1d004f86d6b067ef543fc308e'
 readonly DOWNLOAD_URL="https://github.com/$REPOSITORY/releases/download/v$VERSION/vps-tcp-tune.sh"
 readonly INSTALL_PATH='/usr/local/bin/vps-tcp-tune'
 

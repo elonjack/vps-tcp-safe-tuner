@@ -299,7 +299,8 @@ calculate_buffer() {
   local bdp multiplier cap result memory
   memory=$(memory_mib); case "$ROLE" in proxy) multiplier=3 ;; *) multiplier=2 ;; esac
   [[ -z $BUFFER_MULTIPLIER_OVERRIDE ]] || multiplier=$BUFFER_MULTIPLIER_OVERRIDE
-  bdp=$(( BANDWIDTH_MBIT * RTT_MS / 8 )); cap=$(( memory * 1024 * 1024 / 12 )); (( cap > 134217728 )) && cap=134217728
+  # BDP（字节）= 带宽 Mbit/s × RTT ms × 125；不能遗漏 Mbit/ms 到字节的单位换算。
+  bdp=$(( BANDWIDTH_MBIT * RTT_MS * 125 )); cap=$(( memory * 1024 * 1024 / 12 )); (( cap > 134217728 )) && cap=134217728
   result=$(( bdp * multiplier )); (( result < 4194304 )) && result=4194304; (( result > cap )) && result=$cap; (( result < 4194304 )) && result=4194304
   printf '%s' "$result"
 }
