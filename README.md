@@ -29,7 +29,7 @@
 
 ## 安装与使用
 
-从 GitHub Release 下载脚本后，先校验 SHA-256，再在 VPS 上执行。请不要直接把网络内容管道给 shell。
+从 GitHub 仓库或 Release 下载脚本后，先校验 SHA-256，再在 VPS 上执行。请不要直接把网络内容管道给 shell。
 
 ```bash
 chmod 755 vps-tcp-tune.sh
