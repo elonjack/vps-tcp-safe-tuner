@@ -36,7 +36,7 @@
 一键安装固定版本。安装器会下载 GitHub Release 资产并在安装前校验 SHA-256：
 
 ```bash
-bash <(curl -fsSL https://raw.githubusercontent.com/elonjack/vps-tcp-safe-tuner/v3.6.0/install.sh)
+bash <(curl -fsSL https://raw.githubusercontent.com/elonjack/vps-tcp-safe-tuner/v3.6.1/install.sh)
 ```
 
 在交互终端中，安装完成会自动打开中文菜单；选择 1 即可完成测量、自动加载内核已有的 BBR、应用与复测。也可之后手动运行：
@@ -83,7 +83,7 @@ sudo ./vps-tcp-tune.sh auto --peer YOUR_IPERF3_HOST --role proxy
 
 ### 代理加速应怎样选择
 
-菜单中用途请选择 `proxy`。此模式的缓冲区上限仍由带宽、业务 RTT 和内存推导；同时把 TCP 初始收发缓冲区设为 1 MiB，改善代理短连接、请求上传和首包起速。`general` 保持较保守的 512 KiB 初始值，适合普通 VPS。
+菜单中用途请选择 `proxy`。此模式的缓冲区上限仍由带宽、业务 RTT 和内存推导；同时把 `tcp_rmem` 和 `tcp_wmem` 的 TCP 初始收发缓冲区设为 1 MiB，改善代理短连接、请求上传和首包起速。`general` 保持较保守的 512 KiB 初始值，适合普通 VPS；不会改动 UDP 等其他协议的全局 socket 默认缓冲区。
 
 测速报告里的“去程”通常是中国测试节点到 VPS，近似于代理客户端发出请求或上传数据；“回程”是 VPS 到中国测试节点，近似于网页、视频等响应数据。用于日常代理浏览和流媒体时，回程吞吐、丢包和延迟是主要指标；去程仍会影响握手、请求、上传和双向传输。
 

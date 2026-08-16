@@ -6,7 +6,7 @@ set -Eeuo pipefail
 IFS=$'\n\t'
 umask 077
 
-readonly VERSION='3.6.0'
+readonly VERSION='3.6.1'
 readonly STATE_DIR='/var/lib/vps-tcp-safe-tuner'
 readonly SNAPSHOT_FILE="$STATE_DIR/baseline.tsv"
 readonly FACTS_FILE="$STATE_DIR/facts.tsv"
@@ -324,7 +324,6 @@ build_settings() {
   buffer=$(calculate_buffer); initial_buffer=$(calculate_initial_buffer "$buffer"); backlog=$(calculate_backlog); case "$ROLE" in proxy|server) socket_queue=8192; syn_queue=8192 ;; *) socket_queue=4096; syn_queue=4096 ;; esac
   add_setting net.core.default_qdisc fq; add_setting net.ipv4.tcp_congestion_control bbr
   add_setting net.core.rmem_max "$buffer"; add_setting net.core.wmem_max "$buffer"
-  add_setting net.core.rmem_default "$initial_buffer"; add_setting net.core.wmem_default "$initial_buffer"
   add_setting net.ipv4.tcp_rmem "4096 $initial_buffer $buffer"; add_setting net.ipv4.tcp_wmem "4096 $initial_buffer $buffer"
   add_setting net.ipv4.tcp_mtu_probing 1; add_setting net.ipv4.tcp_slow_start_after_idle 0; add_setting net.ipv4.tcp_moderate_rcvbuf 1
   add_setting net.core.netdev_max_backlog "$backlog"; add_setting net.core.somaxconn "$socket_queue"; add_setting net.ipv4.tcp_max_syn_backlog "$syn_queue"
@@ -410,6 +409,19 @@ restore_snapshot_values() {
   local key value; [[ -f $SNAPSHOT_FILE ]] || return 0
   while IFS=$'\t' read -r key value; do [[ -z $key ]] || { sysctl_exists "$key" && sysctl -q -w "$key=$value" || warn "恢复 $key 失败。"; }; done <"$SNAPSHOT_FILE"
 }
+restore_legacy_core_defaults() {
+  # v3.6.0 曾误把 TCP 初始值同时写入全局 socket 默认值。TCP 实际由
+  # tcp_rmem/tcp_wmem 控制；升级时只在确认是本工具旧配置后恢复这两项。
+  local key saved
+  [[ -f $CONFIG_FILE && -f $SNAPSHOT_FILE ]] || return 0
+  for key in net.core.rmem_default net.core.wmem_default; do
+    grep -Fqx "$key = 1048576" "$CONFIG_FILE" || continue
+    saved=$(awk -F'\t' -v wanted="$key" '$1 == wanted { print $2; exit }' "$SNAPSHOT_FILE")
+    [[ -n $saved ]] || continue
+    sysctl -q -w "$key=$saved" || return 1
+    say "已恢复不再管理的 $key。"
+  done
+}
 apply_built_settings() {
   local index
   for index in "${!KEYS[@]}"; do
@@ -422,6 +434,11 @@ apply_tuning() {
   (( DRY_RUN )) && { ok '预览完成，未修改系统。'; return 0; }; confirm '将自动启用内核已有的 BBR（如尚未加载）、写入 sysctl、保存精确快照并立即应用自适应 TCP 参数。继续吗？' || { say '已取消。'; return 0; }
   ensure_bbr
   snapshot_if_needed
+  if ! restore_legacy_core_defaults; then
+    warn '旧版全局 socket 默认值恢复失败，正在恢复首次快照。'
+    restore_snapshot_values; remove_bbr_module_config
+    fail '调优失败，已执行回滚。'
+  fi
   if ! apply_built_settings; then
     warn '候选 sysctl 应用失败，正在恢复首次快照。'
     restore_snapshot_values; remove_bbr_module_config
