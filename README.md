@@ -11,6 +11,7 @@
 | 机器画像 | 内核、BBR、内存、虚拟化、默认网卡与活动 qdisc 检测 |
 | 多轮基准实验 | 同一对端多轮测试，使用中位吞吐减少偶发波动；记录重传、RTT 与估算流量 |
 | 自适应 BDP | 使用实测带宽和 RTT，按用途与内存限制推导 TCP 缓冲区 |
+| 缓冲区 A/B 搜索 | 可选比较 1×、2×、3× BDP 缓冲区，保留吞吐最高且重传可接受的候选 |
 | TCP 调优 | BBR、FQ 默认队列、收发缓冲区、MTU 探测、慢启动、backlog 与连接队列 |
 | 限速器处理 | 可选、明确确认的 HTB + FQ 整形；以基线向上粗扫、拐点区间细扫、两轮复测候选 |
 | 性能保护 | 调优前后使用相同对端复测；吞吐明显退化或重传明显增加时默认自动回滚 |
@@ -34,7 +35,7 @@
 一键安装固定版本。安装器会下载 GitHub Release 资产并在安装前校验 SHA-256：
 
 ```bash
-bash <(curl -fsSL https://raw.githubusercontent.com/elonjack/vps-tcp-safe-tuner/v3.1.0/install.sh)
+bash <(curl -fsSL https://raw.githubusercontent.com/elonjack/vps-tcp-safe-tuner/v3.2.0/install.sh)
 ```
 
 安装后可直接运行：
@@ -78,6 +79,12 @@ sudo ./vps-tcp-tune.sh auto --peer YOUR_IPERF3_HOST --role proxy
 ```
 
 该流程会先记录 3 轮基准、显示推导参数、确认后应用，再以同一对端复测 3 轮。若吞吐下降超过 15%，或原本零重传而复测累计出现超过 10 次重传，默认自动回滚。测速会消耗流量，默认每轮为 4 流、12 秒；可用 `--rounds 1` 到 `--rounds 5` 调整。
+
+如需进一步针对当前线路搜索缓冲区上限，可显式启用 A/B 搜索。该模式会额外进行 3 组、每组 2 轮测试，因此仅建议在流量充足且业务低峰时使用：
+
+```bash
+sudo vps-tcp-tune auto --role proxy --search-buffers
+```
 
 如果已知出口带宽与典型 RTT：
 

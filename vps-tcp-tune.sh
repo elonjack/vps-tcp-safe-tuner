@@ -6,7 +6,7 @@ set -Eeuo pipefail
 IFS=$'\n\t'
 umask 077
 
-readonly VERSION='3.1.0'
+readonly VERSION='3.2.0'
 readonly STATE_DIR='/var/lib/vps-tcp-safe-tuner'
 readonly SNAPSHOT_FILE="$STATE_DIR/baseline.tsv"
 readonly FACTS_FILE="$STATE_DIR/facts.tsv"
@@ -19,7 +19,7 @@ readonly REPORT_DIR='/var/log/vps-tcp-safe-tuner'
 readonly MARKER='# Managed by vps-tcp-safe-tuner. Remove only with vps-tcp-tune rollback.'
 
 COMMAND='menu'; ROLE='general'; PEER=''; PEER_PORT='5201'; BANDWIDTH_MBIT=''; RTT_MS=''
-DURATION='12'; WORKERS='4'; ROUNDS='3'; PEER_MAX_RTT='120'; SHAPE_RATE=''; ENABLE_SHAPING=0; DRY_RUN=0; ASSUME_YES=0; NO_INSTALL=0; KEEP_ON_REGRESSION=0
+DURATION='12'; WORKERS='4'; ROUNDS='3'; PEER_MAX_RTT='120'; BUFFER_MULTIPLIER_OVERRIDE=''; SHAPE_RATE=''; ENABLE_SHAPING=0; BUFFER_SEARCH=0; DRY_RUN=0; ASSUME_YES=0; NO_INSTALL=0; KEEP_ON_REGRESSION=0
 TUNING_APPLIED=0
 
 # 第三方公开 iperf3 节点。自动模式会按 RTT 排序、依次做短测试；用户也可用 --peer 覆盖。
@@ -78,6 +78,7 @@ vps-tcp-tune - 自适应 Linux VPS TCP 调优工具
   --rounds N           每个阶段的独立测试轮数，默认 3，范围 1 到 5
   --peer-max-rtt MS    自动选择公共对端的最大 RTT，默认 120 ms
   --enable-shaping     auto 成功后，允许进入限速器扫描和整形候选流程
+  --search-buffers     对 1×、2×、3× BDP 缓冲区进行 A/B 测试并自动保留最佳候选
   --shape-rate MBIT    shape 使用的目标速率
   --no-install         不允许脚本安装 iperf3
   --keep-on-regression 即使复测明显退化，也不自动回滚（默认会回滚）
@@ -163,7 +164,9 @@ auto_pick_peer() {
     fi
     say "尝试公共节点：$location / $provider（RTT 约 ${rtt}ms）。"
     for port in "${ports[@]}"; do
-      probe=$(timeout 12 iperf3 -c "$host" -p "$port" -P 1 -t 3 --omit 1 2>&1) || continue
+      # 先只做 TCP 握手；避免对每个端口都跑秒级满速 iperf3 测试。
+      timeout 4 bash -c 'cat < /dev/null > "/dev/tcp/$1/$2"' _ "$host" "$port" 2>/dev/null || continue
+      probe=$(timeout 8 iperf3 -c "$host" -p "$port" -P 1 -t 2 2>&1) || continue
       if [[ $probe == *'receiver'* ]]; then
         PEER=$host; PEER_PORT=$port
         ok "已选择公共对端：$PEER:$PEER_PORT（$location / $provider）。"
@@ -262,6 +265,7 @@ derive_network_facts() {
 calculate_buffer() {
   local bdp multiplier cap result memory
   memory=$(memory_mib); case "$ROLE" in proxy) multiplier=3 ;; *) multiplier=2 ;; esac
+  [[ -z $BUFFER_MULTIPLIER_OVERRIDE ]] || multiplier=$BUFFER_MULTIPLIER_OVERRIDE
   bdp=$(( BANDWIDTH_MBIT * RTT_MS / 8 )); cap=$(( memory * 1024 * 1024 / 12 )); (( cap > 134217728 )) && cap=134217728
   result=$(( bdp * multiplier )); (( result < 4194304 )) && result=4194304; (( result > cap )) && result=$cap; (( result < 4194304 )) && result=4194304
   printf '%s' "$result"
@@ -304,7 +308,7 @@ snapshot_if_needed() {
 }
 write_facts() {
   install -d -m 700 "$STATE_DIR"
-  { printf 'role\t%s\n' "$ROLE"; printf 'bandwidth_mbit\t%s\n' "$BANDWIDTH_MBIT"; printf 'rtt_ms\t%s\n' "$RTT_MS"; printf 'peer\t%s\n' "$PEER"; printf 'measured_mbit\t%s\n' "${MEASURE_RATE:-}"; printf 'measured_retrans\t%s\n' "${MEASURE_RETRANS:-}"; } >"$FACTS_FILE"
+  { printf 'role\t%s\n' "$ROLE"; printf 'bandwidth_mbit\t%s\n' "$BANDWIDTH_MBIT"; printf 'rtt_ms\t%s\n' "$RTT_MS"; printf 'buffer_bdp_multiplier\t%s\n' "${BUFFER_MULTIPLIER_OVERRIDE:-default}"; printf 'peer\t%s\n' "$PEER"; printf 'measured_mbit\t%s\n' "${MEASURE_RATE:-}"; printf 'measured_retrans\t%s\n' "${MEASURE_RETRANS:-}"; } >"$FACTS_FILE"
   chmod 600 "$FACTS_FILE"
 }
 write_experiment_report() {
@@ -320,6 +324,7 @@ write_experiment_report() {
     printf 'duration_seconds\t%s\n' "$DURATION"
     printf 'workers\t%s\n' "$WORKERS"
     printf 'rtt_ms\t%s\n' "$RTT_MS"
+    printf 'buffer_bdp_multiplier\t%s\n' "${BUFFER_MULTIPLIER_OVERRIDE:-default}"
     printf 'baseline_mbit\t%s\n' "$baseline_rate"
     printf 'baseline_retrans\t%s\n' "$baseline_retrans"
     printf 'after_mbit\t%s\n' "$after_rate"
@@ -351,13 +356,57 @@ restore_snapshot_values() {
   local key value; [[ -f $SNAPSHOT_FILE ]] || return 0
   while IFS=$'\t' read -r key value; do [[ -z $key ]] || { sysctl_exists "$key" && sysctl -q -w "$key=$value" || warn "恢复 $key 失败。"; }; done <"$SNAPSHOT_FILE"
 }
+apply_built_settings() {
+  local index
+  for index in "${!KEYS[@]}"; do
+    sysctl -q -w "${KEYS[$index]}=${VALUES[$index]}" || return 1
+  done
+}
 apply_tuning() {
   TUNING_APPLIED=0
   require_root; require_linux; require_command sysctl; require_command ip; require_command tc; lock; validate_common; derive_network_facts; build_settings; show_plan
   (( DRY_RUN )) && { ok '预览完成，未修改系统。'; return 0; }; confirm '将写入 sysctl、保存精确快照并立即应用自适应 TCP 参数。继续吗？' || { say '已取消。'; return 0; }
-  snapshot_if_needed; local i
-  for i in "${!KEYS[@]}"; do if ! sysctl -q -w "${KEYS[$i]}=${VALUES[$i]}"; then warn "${KEYS[$i]} 应用失败，正在恢复首次快照。"; restore_snapshot_values; fail '调优失败，已执行回滚。'; fi; done
+  snapshot_if_needed
+  if ! apply_built_settings; then
+    warn '候选 sysctl 应用失败，正在恢复首次快照。'
+    restore_snapshot_values
+    fail '调优失败，已执行回滚。'
+  fi
   write_config; write_facts; TUNING_APPLIED=1; ok "已应用 ${#KEYS[@]} 项自适应 TCP 设置。"
+}
+search_buffer_candidates() {
+  local saved_override=$BUFFER_MULTIPLIER_OVERRIDE saved_rounds=$ROUNDS candidate candidate_rate candidate_retrans best_multiplier='' best_rate=0 best_retrans=0
+  local -a candidates=(1 2 3)
+  say '开始 BDP 缓冲区 A/B 搜索：分别测试 1×、2×、3× BDP 上限。'
+  say '每个候选使用两轮测试；仅保留吞吐最高且重传不明显恶化的候选。'
+  ROUNDS=2
+  for candidate in "${candidates[@]}"; do
+    BUFFER_MULTIPLIER_OVERRIDE=$candidate
+    build_settings
+    if ! apply_built_settings; then
+      warn "${candidate}× BDP 参数无法应用，已跳过。"
+      continue
+    fi
+    measure
+    candidate_rate=$MEASURE_RATE; candidate_retrans=$MEASURE_RETRANS
+    say "${candidate}× BDP：中位吞吐 ${candidate_rate}Mbit，累计重传 ${candidate_retrans}。"
+    if (( candidate_retrans <= 10 && candidate_rate > best_rate )); then
+      best_multiplier=$candidate; best_rate=$candidate_rate; best_retrans=$candidate_retrans
+    fi
+  done
+  ROUNDS=$saved_rounds
+  if [[ -z $best_multiplier ]]; then
+    BUFFER_MULTIPLIER_OVERRIDE=$saved_override
+    build_settings
+    apply_built_settings || { restore_snapshot_values; fail '所有缓冲区候选均失败，已恢复快照。'; }
+    warn '没有重传可接受的缓冲区候选，已恢复搜索前配置。'
+    return 0
+  fi
+  BUFFER_MULTIPLIER_OVERRIDE=$best_multiplier
+  build_settings
+  apply_built_settings || { restore_snapshot_values; fail '最佳缓冲区候选应用失败，已恢复快照。'; }
+  write_config
+  say "已选择 ${best_multiplier}× BDP 缓冲区：${best_rate}Mbit，累计重传 ${best_retrans}。"
 }
 
 qdisc_snapshot() {
@@ -490,6 +539,10 @@ auto() {
   say '阶段 2/3：应用按基线推导的候选配置。'
   apply_tuning
   (( TUNING_APPLIED )) || { say '候选配置未应用，已结束实验。'; return 0; }
+  if (( BUFFER_SEARCH )); then
+    say '附加阶段：搜索当前线路更合适的 BDP 缓冲区倍率。'
+    search_buffer_candidates
+  fi
   say '阶段 3/3：使用同一对端、同一轮次复测。'
   measure
   after_rate=$MEASURE_RATE; after_retrans=$MEASURE_RETRANS
@@ -544,7 +597,7 @@ menu() {
 parse_options() {
   while (($#)); do case "$1" in
     --peer) PEER=${2:-}; shift 2 ;; --port) PEER_PORT=${2:-}; shift 2 ;; --role) ROLE=${2:-}; shift 2 ;; --bandwidth) BANDWIDTH_MBIT=${2:-}; shift 2 ;; --rtt) RTT_MS=${2:-}; shift 2 ;; --duration) DURATION=${2:-}; shift 2 ;; --workers) WORKERS=${2:-}; shift 2 ;; --rounds) ROUNDS=${2:-}; shift 2 ;; --shape-rate) SHAPE_RATE=${2:-}; shift 2 ;;
-    --enable-shaping) ENABLE_SHAPING=1; shift ;; --dry-run) DRY_RUN=1; shift ;; --yes) ASSUME_YES=1; shift ;; --no-install) NO_INSTALL=1; shift ;; --keep-on-regression) KEEP_ON_REGRESSION=1; shift ;; -h|--help) usage; exit 0 ;; *) fail "未知选项：$1" ;;
+    --enable-shaping) ENABLE_SHAPING=1; shift ;; --search-buffers) BUFFER_SEARCH=1; shift ;; --dry-run) DRY_RUN=1; shift ;; --yes) ASSUME_YES=1; shift ;; --no-install) NO_INSTALL=1; shift ;; --keep-on-regression) KEEP_ON_REGRESSION=1; shift ;; -h|--help) usage; exit 0 ;; *) fail "未知选项：$1" ;;
   esac; done
 }
 main() {
