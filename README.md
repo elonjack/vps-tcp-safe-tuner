@@ -9,11 +9,12 @@
 | 能力 | 说明 |
 | --- | --- |
 | 机器画像 | 内核、BBR、内存、虚拟化、默认网卡与活动 qdisc 检测 |
-| 真实测量 | 指定 iperf3 对端，多流吞吐、发送端重传、平均 RTT |
+| 多轮基准实验 | 同一对端多轮测试，使用中位吞吐减少偶发波动；记录重传、RTT 与估算流量 |
 | 自适应 BDP | 使用实测带宽和 RTT，按用途与内存限制推导 TCP 缓冲区 |
 | TCP 调优 | BBR、FQ 默认队列、收发缓冲区、MTU 探测、慢启动、backlog 与连接队列 |
 | 限速器处理 | 可选、明确确认的 HTB + FQ 整形；先扫描候选，绝不默认改活动 qdisc |
-| 持久化与回滚 | 专属 sysctl/systemd 文件；首次变更前保存精确 sysctl 快照 |
+| 性能保护 | 调优前后使用相同对端复测；吞吐明显退化或重传明显增加时默认自动回滚 |
+| 持久化与回滚 | 专属 sysctl/systemd 文件；首次变更前保存精确 sysctl 快照与实验报告 |
 
 ## 安全设计
 
@@ -33,7 +34,7 @@
 一键安装固定版本。安装器会下载 GitHub Release 资产并在安装前校验 SHA-256：
 
 ```bash
-bash <(curl -fsSL https://raw.githubusercontent.com/elonjack/vps-tcp-safe-tuner/v2.0.0/install.sh)
+bash <(curl -fsSL https://raw.githubusercontent.com/elonjack/vps-tcp-safe-tuner/v3.0.0/install.sh)
 ```
 
 安装后可直接运行：
@@ -61,7 +62,7 @@ sudo vps-tcp-tune
 也可以明确使用自动公共节点：
 
 ```bash
-sudo vps-tcp-tune auto --role proxy
+sudo vps-tcp-tune auto --role proxy --rounds 3
 ```
 
 若需最可重复、最贴近业务目标的测量，推荐准备一台自有或可信的 iperf3 服务端：
@@ -76,7 +77,7 @@ iperf3 -s
 sudo ./vps-tcp-tune.sh auto --peer YOUR_IPERF3_HOST --role proxy
 ```
 
-该流程会先测量、显示推导参数、确认后应用，并立即再次验证。测速会消耗流量，默认每次为 4 流、12 秒。
+该流程会先记录 3 轮基准、显示推导参数、确认后应用，再以同一对端复测 3 轮。若吞吐下降超过 15%，或原本零重传而复测累计出现超过 10 次重传，默认自动回滚。测速会消耗流量，默认每轮为 4 流、12 秒；可用 `--rounds 1` 到 `--rounds 5` 调整。
 
 如果已知出口带宽与典型 RTT：
 

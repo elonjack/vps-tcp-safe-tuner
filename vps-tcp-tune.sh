@@ -6,7 +6,7 @@ set -Eeuo pipefail
 IFS=$'\n\t'
 umask 077
 
-readonly VERSION='2.0.0'
+readonly VERSION='3.0.0'
 readonly STATE_DIR='/var/lib/vps-tcp-safe-tuner'
 readonly SNAPSHOT_FILE="$STATE_DIR/baseline.tsv"
 readonly FACTS_FILE="$STATE_DIR/facts.tsv"
@@ -15,10 +15,12 @@ readonly LOCK_FILE='/run/lock/vps-tcp-safe-tuner.lock'
 readonly SHAPE_SCRIPT='/usr/local/sbin/vps-tcp-safe-tuner-qdisc'
 readonly SHAPE_UNIT='/etc/systemd/system/vps-tcp-safe-tuner-qdisc.service'
 readonly SHAPE_STATE="$STATE_DIR/qdisc.tsv"
+readonly REPORT_DIR='/var/log/vps-tcp-safe-tuner'
 readonly MARKER='# Managed by vps-tcp-safe-tuner. Remove only with vps-tcp-tune rollback.'
 
 COMMAND='menu'; ROLE='general'; PEER=''; PEER_PORT='5201'; BANDWIDTH_MBIT=''; RTT_MS=''
-DURATION='12'; WORKERS='4'; SHAPE_RATE=''; ENABLE_SHAPING=0; DRY_RUN=0; ASSUME_YES=0; NO_INSTALL=0
+DURATION='12'; WORKERS='4'; ROUNDS='3'; SHAPE_RATE=''; ENABLE_SHAPING=0; DRY_RUN=0; ASSUME_YES=0; NO_INSTALL=0; KEEP_ON_REGRESSION=0
+TUNING_APPLIED=0
 
 # 第三方公开 iperf3 节点。自动模式会按 RTT 排序、依次做短测试；用户也可用 --peer 覆盖。
 # 节点可用性会变化，因此自动选择失败时会给出明确提示，不会伪造测量结果。
@@ -52,7 +54,7 @@ vps-tcp-tune - 自适应 Linux VPS TCP 调优工具
 命令：
   menu                         中文交互菜单（默认）
   audit                        只检测内核、虚拟化、网卡和 TCP 能力
-  measure --peer 主机          以指定 iperf3 服务端做吞吐、重传、RTT 基线测试
+  measure [--peer 主机]        多轮吞吐、重传、RTT 基线测试；省略对端则自动选择公共节点
   auto --peer 主机             实测后自动推导 BDP 并应用调优
   apply --bandwidth N --rtt N  按已知带宽/RTT 应用调优
   shape --shape-rate N         应用 HTB + FQ 出向整形（须先明确确认）
@@ -69,15 +71,18 @@ vps-tcp-tune - 自适应 Linux VPS TCP 调优工具
   --rtt MS             典型 RTT（毫秒）
   --duration SEC       单次 iperf3 测试时长，默认 12 秒
   --workers N          iperf3 并发流数，默认 4
+  --rounds N           每个阶段的独立测试轮数，默认 3，范围 1 到 5
   --enable-shaping     auto 成功后，允许进入限速器扫描和整形候选流程
   --shape-rate MBIT    shape 使用的目标速率
   --no-install         不允许脚本安装 iperf3
+  --keep-on-regression 即使复测明显退化，也不自动回滚（默认会回滚）
   --dry-run            仅显示动作，不写入系统
   --yes                非交互确认（整形仍要求 --enable-shaping）
 
 示例：
   sudo bash vps-tcp-tune.sh audit
   sudo bash vps-tcp-tune.sh auto --peer 203.0.113.10 --role proxy
+  sudo bash vps-tcp-tune.sh auto --rounds 3 --role proxy
   sudo bash vps-tcp-tune.sh apply --bandwidth 1000 --rtt 150 --role proxy
   sudo bash vps-tcp-tune.sh shape --shape-rate 950 --enable-shaping
   sudo bash vps-tcp-tune.sh rollback
@@ -123,6 +128,7 @@ validate_common() {
   is_positive_integer "$PEER_PORT" && (( PEER_PORT <= 65535 )) || fail '--port 必须是 1 到 65535 的整数。'
   is_positive_integer "$DURATION" && (( DURATION <= 120 )) || fail '--duration 必须是 1 到 120 的整数。'
   is_positive_integer "$WORKERS" && (( WORKERS <= 32 )) || fail '--workers 必须是 1 到 32 的整数。'
+  is_positive_integer "$ROUNDS" && (( ROUNDS <= 5 )) || fail '--rounds 必须是 1 到 5 的整数。'
   [[ -z $BANDWIDTH_MBIT ]] || { is_positive_integer "$BANDWIDTH_MBIT" && (( BANDWIDTH_MBIT <= 100000 )) || fail '--bandwidth 必须是 1 到 100000 的整数。'; }
   [[ -z $RTT_MS ]] || { is_positive_integer "$RTT_MS" && (( RTT_MS <= 3000 )) || fail '--rtt 必须是 1 到 3000 的整数。'; }
 }
@@ -193,11 +199,42 @@ measure() {
   require_linux; require_command timeout; validate_common; ensure_iperf3
   [[ -n $PEER ]] || auto_pick_peer
   validate_peer
-  say "开始测试：对端=$PEER:$PEER_PORT，并发=$WORKERS，时长=${DURATION}s。"
-  say '测试会产生实际流量；请确认套餐流量充足。'
-  MEASURE_OUTPUT=$(timeout "$(( DURATION + 15 ))" iperf3 -c "$PEER" -p "$PEER_PORT" -P "$WORKERS" -t "$DURATION" --omit 2 2>&1) || { yellow "$MEASURE_OUTPUT"; printf '\n'; fail 'iperf3 测试失败；请检查对端、端口、防火墙和出口连通性。'; }
-  parse_iperf_result "$MEASURE_OUTPUT" || { yellow "$MEASURE_OUTPUT"; printf '\n'; fail '无法解析 iperf3 输出，请使用官方 iperf3。'; }
-  measure_rtt; line; say "实测接收吞吐：${MEASURE_RATE} Mbit/s"; say "发送端重传计数：${MEASURE_RETRANS}"; say "ping 平均 RTT：${MEASURE_RTT:-未取得} ms"; line
+  local temporary_file round valid required rate retrans median_index estimated_mb
+  temporary_file=$(mktemp)
+  chmod 600 "$temporary_file"
+  valid=0
+  required=$(( (ROUNDS + 1) / 2 ))
+  say "开始 ${ROUNDS} 轮测试：对端=$PEER:$PEER_PORT，并发=$WORKERS，单轮=${DURATION}s。"
+  say '测试会产生实际流量；为降低偶发波动影响，最终使用有效轮次的中位吞吐。'
+  for ((round = 1; round <= ROUNDS; round += 1)); do
+    MEASURE_OUTPUT=$(timeout "$(( DURATION + 15 ))" iperf3 -c "$PEER" -p "$PEER_PORT" -P "$WORKERS" -t "$DURATION" --omit 2 2>&1) || {
+      warn "第 $round 轮测试失败，已跳过。"
+      continue
+    }
+    if ! parse_iperf_result "$MEASURE_OUTPUT"; then
+      warn "第 $round 轮输出无法解析，已跳过。"
+      continue
+    fi
+    rate=$MEASURE_RATE; retrans=$MEASURE_RETRANS
+    printf '%s\t%s\n' "$rate" "$retrans" >>"$temporary_file"
+    valid=$(( valid + 1 ))
+    say "第 $round 轮：${rate} Mbit/s，重传 ${retrans}。"
+  done
+  if (( valid < required )); then
+    rm -f "$temporary_file"
+    fail "仅 $valid/$ROUNDS 轮测试有效，少于所需的 $required 轮；拒绝据此调优。"
+  fi
+  median_index=$(( (valid + 1) / 2 ))
+  MEASURE_RATE=$(sort -n -k 1,1 "$temporary_file" | awk -v index="$median_index" 'NR == index {print $1}')
+  MEASURE_RETRANS=$(awk -F'\t' '{total += $2} END {printf "%.0f", total}' "$temporary_file")
+  estimated_mb=$(awk -v rate="$MEASURE_RATE" -v seconds="$DURATION" -v count="$valid" 'BEGIN {printf "%.0f", rate * seconds * count / 8}')
+  rm -f "$temporary_file"
+  measure_rtt
+  line
+  say "有效轮次：$valid/$ROUNDS；中位吞吐：${MEASURE_RATE} Mbit/s。"
+  say "有效轮次累计发送端重传：${MEASURE_RETRANS}；估算测试流量约 ${estimated_mb} MB。"
+  say "ping 平均 RTT：${MEASURE_RTT:-未取得} ms。"
+  line
 }
 
 infer_bandwidth_from_nic() {
@@ -260,6 +297,41 @@ write_facts() {
   { printf 'role\t%s\n' "$ROLE"; printf 'bandwidth_mbit\t%s\n' "$BANDWIDTH_MBIT"; printf 'rtt_ms\t%s\n' "$RTT_MS"; printf 'peer\t%s\n' "$PEER"; printf 'measured_mbit\t%s\n' "${MEASURE_RATE:-}"; printf 'measured_retrans\t%s\n' "${MEASURE_RETRANS:-}"; } >"$FACTS_FILE"
   chmod 600 "$FACTS_FILE"
 }
+write_experiment_report() {
+  local baseline_rate=$1 baseline_retrans=$2 after_rate=$3 after_retrans=$4 decision=$5 report_file
+  install -d -m 700 "$REPORT_DIR"
+  report_file="$REPORT_DIR/experiment-$(date -u '+%Y%m%dT%H%M%SZ').tsv"
+  {
+    printf 'generated_utc\t%s\n' "$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+    printf 'decision\t%s\n' "$decision"
+    printf 'peer\t%s:%s\n' "$PEER" "$PEER_PORT"
+    printf 'role\t%s\n' "$ROLE"
+    printf 'rounds\t%s\n' "$ROUNDS"
+    printf 'duration_seconds\t%s\n' "$DURATION"
+    printf 'workers\t%s\n' "$WORKERS"
+    printf 'rtt_ms\t%s\n' "$RTT_MS"
+    printf 'baseline_mbit\t%s\n' "$baseline_rate"
+    printf 'baseline_retrans\t%s\n' "$baseline_retrans"
+    printf 'after_mbit\t%s\n' "$after_rate"
+    printf 'after_retrans\t%s\n' "$after_retrans"
+    awk -v before="$baseline_rate" -v after="$after_rate" 'BEGIN {if (before > 0) printf "gain_percent\t%.2f\n", (after-before)*100/before}'
+  } >"$report_file"
+  chmod 600 "$report_file"
+  say "实验报告：$report_file"
+}
+is_material_regression() {
+  local baseline_rate=$1 baseline_retrans=$2 after_rate=$3 after_retrans=$4
+  (( after_rate * 100 < baseline_rate * 85 )) && return 0
+  (( baseline_retrans == 0 && after_retrans > 10 )) && return 0
+  return 1
+}
+revert_auto_experiment() {
+  warn '复测显示明显退化，正在恢复本次 TCP 参数。'
+  restore_snapshot_values
+  rm -f "$CONFIG_FILE" "$FACTS_FILE" "$SNAPSHOT_FILE"
+  rmdir "$STATE_DIR" 2>/dev/null || true
+  ok '已自动回滚本次实验参数；实验报告仍保留。'
+}
 write_config() {
   local tmp i; tmp=$(mktemp "${CONFIG_FILE}.XXXXXX"); chmod 644 "$tmp"
   { printf '%s\n' "$MARKER"; printf '# role=%s bandwidth=%sMbit rtt=%sms generated=%s\n' "$ROLE" "$BANDWIDTH_MBIT" "$RTT_MS" "$(date -u '+%Y-%m-%dT%H:%M:%SZ')"; for i in "${!KEYS[@]}"; do printf '%s = %s\n' "${KEYS[$i]}" "${VALUES[$i]}"; done; } >"$tmp"
@@ -270,11 +342,12 @@ restore_snapshot_values() {
   while IFS=$'\t' read -r key value; do [[ -z $key ]] || { sysctl_exists "$key" && sysctl -q -w "$key=$value" || warn "恢复 $key 失败。"; }; done <"$SNAPSHOT_FILE"
 }
 apply_tuning() {
+  TUNING_APPLIED=0
   require_root; require_linux; require_command sysctl; require_command ip; require_command tc; lock; validate_common; derive_network_facts; build_settings; show_plan
   (( DRY_RUN )) && { ok '预览完成，未修改系统。'; return 0; }; confirm '将写入 sysctl、保存精确快照并立即应用自适应 TCP 参数。继续吗？' || { say '已取消。'; return 0; }
   snapshot_if_needed; local i
   for i in "${!KEYS[@]}"; do if ! sysctl -q -w "${KEYS[$i]}=${VALUES[$i]}"; then warn "${KEYS[$i]} 应用失败，正在恢复首次快照。"; restore_snapshot_values; fail '调优失败，已执行回滚。'; fi; done
-  write_config; write_facts; ok "已应用 ${#KEYS[@]} 项自适应 TCP 设置。"
+  write_config; write_facts; TUNING_APPLIED=1; ok "已应用 ${#KEYS[@]} 项自适应 TCP 设置。"
 }
 
 qdisc_root_kind() { tc qdisc show dev "$1" 2>/dev/null | awk 'NR==1 {print $2}'; }
@@ -340,7 +413,35 @@ scan_shaper_candidate() {
   [[ -n $best ]] && say "建议整形速率候选：${best} Mbit/s；请比较 verify 后再手动执行 shape。" || warn '未得到零重传候选；不要盲目整形。'
 }
 auto() {
-  require_root; require_linux; validate_common; measure; BANDWIDTH_MBIT=$MEASURE_RATE; [[ -n $MEASURE_RTT ]] && RTT_MS=$MEASURE_RTT; derive_network_facts; apply_tuning; say '正在执行调优后验证。'; measure
+  local baseline_rate baseline_retrans after_rate after_retrans decision
+  require_root; require_linux; validate_common
+  say '阶段 1/3：记录调优前基线。'
+  measure
+  baseline_rate=$MEASURE_RATE; baseline_retrans=$MEASURE_RETRANS
+  BANDWIDTH_MBIT=$MEASURE_RATE; [[ -n $MEASURE_RTT ]] && RTT_MS=$MEASURE_RTT
+  derive_network_facts
+  say '阶段 2/3：应用按基线推导的候选配置。'
+  apply_tuning
+  (( TUNING_APPLIED )) || { say '候选配置未应用，已结束实验。'; return 0; }
+  say '阶段 3/3：使用同一对端、同一轮次复测。'
+  measure
+  after_rate=$MEASURE_RATE; after_retrans=$MEASURE_RETRANS
+  decision='retained'
+  if is_material_regression "$baseline_rate" "$baseline_retrans" "$after_rate" "$after_retrans"; then
+    if (( KEEP_ON_REGRESSION )); then
+      decision='retained_by_override'
+      warn '复测出现明显退化，但你指定了 --keep-on-regression，配置将保留。'
+    else
+      decision='rolled_back_regression'
+    fi
+  fi
+  write_experiment_report "$baseline_rate" "$baseline_retrans" "$after_rate" "$after_retrans" "$decision"
+  if [[ $decision == rolled_back_regression ]]; then
+    revert_auto_experiment
+    return 0
+  fi
+  write_facts
+  ok '复测未出现明显退化，已保留候选 TCP 配置。'
   if (( ENABLE_SHAPING )); then
     if [[ $MEASURE_RETRANS == 0 ]]; then say '验证无重传，跳过限速器扫描。';
     else warn '已启用限速器候选扫描。扫描只给出建议，不会持久化整形。'; scan_shaper_candidate; fi
@@ -375,8 +476,8 @@ menu() {
 }
 parse_options() {
   while (($#)); do case "$1" in
-    --peer) PEER=${2:-}; shift 2 ;; --port) PEER_PORT=${2:-}; shift 2 ;; --role) ROLE=${2:-}; shift 2 ;; --bandwidth) BANDWIDTH_MBIT=${2:-}; shift 2 ;; --rtt) RTT_MS=${2:-}; shift 2 ;; --duration) DURATION=${2:-}; shift 2 ;; --workers) WORKERS=${2:-}; shift 2 ;; --shape-rate) SHAPE_RATE=${2:-}; shift 2 ;;
-    --enable-shaping) ENABLE_SHAPING=1; shift ;; --dry-run) DRY_RUN=1; shift ;; --yes) ASSUME_YES=1; shift ;; --no-install) NO_INSTALL=1; shift ;; -h|--help) usage; exit 0 ;; *) fail "未知选项：$1" ;;
+    --peer) PEER=${2:-}; shift 2 ;; --port) PEER_PORT=${2:-}; shift 2 ;; --role) ROLE=${2:-}; shift 2 ;; --bandwidth) BANDWIDTH_MBIT=${2:-}; shift 2 ;; --rtt) RTT_MS=${2:-}; shift 2 ;; --duration) DURATION=${2:-}; shift 2 ;; --workers) WORKERS=${2:-}; shift 2 ;; --rounds) ROUNDS=${2:-}; shift 2 ;; --shape-rate) SHAPE_RATE=${2:-}; shift 2 ;;
+    --enable-shaping) ENABLE_SHAPING=1; shift ;; --dry-run) DRY_RUN=1; shift ;; --yes) ASSUME_YES=1; shift ;; --no-install) NO_INSTALL=1; shift ;; --keep-on-regression) KEEP_ON_REGRESSION=1; shift ;; -h|--help) usage; exit 0 ;; *) fail "未知选项：$1" ;;
   esac; done
 }
 main() {
