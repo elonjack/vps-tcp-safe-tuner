@@ -20,7 +20,9 @@ export ROLE=general
 export BUFFER_MULTIPLIER_OVERRIDE=''
 assert_equals 10650000 "$(calculate_buffer)" '跨境 150ms BDP 缓冲区推导'
 export ROLE=proxy
-assert_equals 1048576 "$(calculate_initial_buffer "$(calculate_buffer)")" '代理初始收发缓冲区'
+assert_equals 10650000 "$(calculate_buffer)" '代理采用保守的 2× BDP 上限'
+assert_equals 1048576 "$(calculate_initial_rmem "$(calculate_buffer)")" '代理初始接收缓冲区'
+assert_equals 262144 "$(calculate_initial_wmem "$(calculate_buffer)")" '代理初始发送缓冲区'
 export ROLE=general
 
 parse_iperf_result '[SUM]   0.00-10.00  sec  1.10 GBytes   944 Mbits/sec    3             sender
@@ -51,5 +53,7 @@ rm -f "$mq_snapshot"
 
 policer_candidate_is_clean 950 8 1000 0 || { printf '限速器干净候选判断失败。\n' >&2; exit 1; }
 if policer_candidate_is_clean 800 0 1000 0; then printf '限速器送达率判断失败。\n' >&2; exit 1; fi
+if ! is_material_regression 100 5 100 21; then printf '重传翻倍回滚判断失败。\n' >&2; exit 1; fi
+if is_material_regression 100 5 100 20; then printf '重传容差判断失败。\n' >&2; exit 1; fi
 
 printf 'Shell 功能测试通过。\n'

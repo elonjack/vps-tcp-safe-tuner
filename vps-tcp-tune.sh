@@ -6,7 +6,7 @@ set -Eeuo pipefail
 IFS=$'\n\t'
 umask 077
 
-readonly VERSION='3.6.1'
+readonly VERSION='3.7.0'
 readonly STATE_DIR='/var/lib/vps-tcp-safe-tuner'
 readonly SNAPSHOT_FILE="$STATE_DIR/baseline.tsv"
 readonly FACTS_FILE="$STATE_DIR/facts.tsv"
@@ -297,19 +297,31 @@ derive_network_facts() {
 }
 calculate_buffer() {
   local bdp multiplier cap result memory
-  memory=$(memory_mib); case "$ROLE" in proxy) multiplier=3 ;; *) multiplier=2 ;; esac
+  memory=$(memory_mib); multiplier=2
   [[ -z $BUFFER_MULTIPLIER_OVERRIDE ]] || multiplier=$BUFFER_MULTIPLIER_OVERRIDE
   # BDP（字节）= 带宽 Mbit/s × RTT ms × 125；不能遗漏 Mbit/ms 到字节的单位换算。
   bdp=$(( BANDWIDTH_MBIT * RTT_MS * 125 )); cap=$(( memory * 1024 * 1024 / 12 )); (( cap > 134217728 )) && cap=134217728
   result=$(( bdp * multiplier )); (( result < 4194304 )) && result=4194304; (( result > cap )) && result=$cap; (( result < 4194304 )) && result=4194304
   printf '%s' "$result"
 }
-calculate_initial_buffer() {
+calculate_initial_rmem() {
   local ceiling=$1 initial
-  # 代理连接需更快完成请求/首包交换；上限仍由 BDP 和内存限制。
+  # TCP 接收初始窗口可加快代理请求和首包交换；上限仍由 BDP 和内存限制。
   case "$ROLE" in
     proxy) initial=1048576 ;;
-    *) initial=524288 ;;
+    server) initial=524288 ;;
+    *) initial=131072 ;;
+  esac
+  (( initial > ceiling )) && initial=$ceiling
+  printf '%s' "$initial"
+}
+calculate_initial_wmem() {
+  local ceiling=$1 initial
+  # 发送初始缓冲不宜与接收窗口同样激进；过大会让代理响应在本机堆积。
+  case "$ROLE" in
+    proxy) initial=262144 ;;
+    server) initial=65536 ;;
+    *) initial=16384 ;;
   esac
   (( initial > ceiling )) && initial=$ceiling
   printf '%s' "$initial"
@@ -319,12 +331,12 @@ calculate_backlog() { if (( BANDWIDTH_MBIT >= 5000 )); then printf 20000; elif (
 declare -a KEYS=() VALUES=()
 add_setting() { sysctl_exists "$1" || { warn "内核不支持 $1，已跳过。"; return 0; }; KEYS+=("$1"); VALUES+=("$2"); }
 build_settings() {
-  local buffer initial_buffer backlog socket_queue syn_queue
+  local buffer initial_rmem initial_wmem backlog socket_queue syn_queue
   KEYS=(); VALUES=()
-  buffer=$(calculate_buffer); initial_buffer=$(calculate_initial_buffer "$buffer"); backlog=$(calculate_backlog); case "$ROLE" in proxy|server) socket_queue=8192; syn_queue=8192 ;; *) socket_queue=4096; syn_queue=4096 ;; esac
+  buffer=$(calculate_buffer); initial_rmem=$(calculate_initial_rmem "$buffer"); initial_wmem=$(calculate_initial_wmem "$buffer"); backlog=$(calculate_backlog); case "$ROLE" in proxy|server) socket_queue=8192; syn_queue=8192 ;; *) socket_queue=4096; syn_queue=4096 ;; esac
   add_setting net.core.default_qdisc fq; add_setting net.ipv4.tcp_congestion_control bbr
   add_setting net.core.rmem_max "$buffer"; add_setting net.core.wmem_max "$buffer"
-  add_setting net.ipv4.tcp_rmem "4096 $initial_buffer $buffer"; add_setting net.ipv4.tcp_wmem "4096 $initial_buffer $buffer"
+  add_setting net.ipv4.tcp_rmem "4096 $initial_rmem $buffer"; add_setting net.ipv4.tcp_wmem "4096 $initial_wmem $buffer"
   add_setting net.ipv4.tcp_mtu_probing 1; add_setting net.ipv4.tcp_slow_start_after_idle 0; add_setting net.ipv4.tcp_moderate_rcvbuf 1
   add_setting net.core.netdev_max_backlog "$backlog"; add_setting net.core.somaxconn "$socket_queue"; add_setting net.ipv4.tcp_max_syn_backlog "$syn_queue"
   [[ $ROLE != proxy ]] || add_setting net.ipv4.ip_local_port_range '10240 65535'
@@ -338,8 +350,8 @@ show_environment() {
   [[ -z $iface ]] || say "活动根 qdisc：$(tc qdisc show dev "$iface" 2>/dev/null | awk 'NR==1 {print $2}')"; line
 }
 show_plan() {
-  local i buffer initial_buffer; buffer=$(calculate_buffer); initial_buffer=$(calculate_initial_buffer "$buffer"); show_environment
-  say "用途=$ROLE；带宽=${BANDWIDTH_MBIT} Mbit/s；业务目标 RTT=${RTT_MS} ms；推导缓冲区上限=${buffer} 字节；初始收发缓冲区=${initial_buffer} 字节。"
+  local i buffer initial_rmem initial_wmem; buffer=$(calculate_buffer); initial_rmem=$(calculate_initial_rmem "$buffer"); initial_wmem=$(calculate_initial_wmem "$buffer"); show_environment
+  say "用途=$ROLE；带宽=${BANDWIDTH_MBIT} Mbit/s；业务目标 RTT=${RTT_MS} ms；推导缓冲区上限=${buffer} 字节；初始接收/发送缓冲区=${initial_rmem}/${initial_wmem} 字节。"
   for i in "${!KEYS[@]}"; do say "${KEYS[$i]}：$(sysctl_value "${KEYS[$i]}") -> ${VALUES[$i]}"; done
   say '默认 qdisc 不会替换现有活动根队列；只有明确执行 shape 时才会改动它。'
 }
@@ -360,7 +372,7 @@ snapshot_if_needed() {
 }
 write_facts() {
   install -d -m 700 "$STATE_DIR"
-  { printf 'role\t%s\n' "$ROLE"; printf 'bandwidth_mbit\t%s\n' "$BANDWIDTH_MBIT"; printf 'target_rtt_ms\t%s\n' "$RTT_MS"; printf 'test_peer_rtt_ms\t%s\n' "${MEASURE_RTT:-}"; printf 'buffer_bdp_multiplier\t%s\n' "${BUFFER_MULTIPLIER_OVERRIDE:-default}"; printf 'peer\t%s\n' "$PEER"; printf 'measured_mbit\t%s\n' "${MEASURE_RATE:-}"; printf 'measured_retrans\t%s\n' "${MEASURE_RETRANS:-}"; } >"$FACTS_FILE"
+  { printf 'role\t%s\n' "$ROLE"; printf 'bandwidth_mbit\t%s\n' "$BANDWIDTH_MBIT"; printf 'target_rtt_ms\t%s\n' "$RTT_MS"; printf 'test_peer_rtt_ms\t%s\n' "${MEASURE_RTT:-}"; printf 'buffer_bdp_multiplier\t%s\n' "${BUFFER_MULTIPLIER_OVERRIDE:-default}"; printf 'tcp_initial_rmem\t%s\n' "$(calculate_initial_rmem "$(calculate_buffer)")"; printf 'tcp_initial_wmem\t%s\n' "$(calculate_initial_wmem "$(calculate_buffer)")"; printf 'peer\t%s\n' "$PEER"; printf 'measured_mbit\t%s\n' "${MEASURE_RATE:-}"; printf 'measured_retrans\t%s\n' "${MEASURE_RETRANS:-}"; } >"$FACTS_FILE"
   chmod 600 "$FACTS_FILE"
 }
 write_experiment_report() {
@@ -391,6 +403,7 @@ is_material_regression() {
   local baseline_rate=$1 baseline_retrans=$2 after_rate=$3 after_retrans=$4
   (( after_rate * 100 < baseline_rate * 85 )) && return 0
   (( baseline_retrans == 0 && after_retrans > 10 )) && return 0
+  (( baseline_retrans > 0 && after_retrans > baseline_retrans * 2 + 10 )) && return 0
   return 1
 }
 revert_auto_experiment() {
