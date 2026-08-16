@@ -6,7 +6,7 @@ set -Eeuo pipefail
 IFS=$'\n\t'
 umask 077
 
-readonly VERSION='3.3.0'
+readonly VERSION='3.3.1'
 readonly STATE_DIR='/var/lib/vps-tcp-safe-tuner'
 readonly SNAPSHOT_FILE="$STATE_DIR/baseline.tsv"
 readonly FACTS_FILE="$STATE_DIR/facts.tsv"
@@ -655,7 +655,17 @@ rollback() {
   [[ -f $SHAPE_STATE ]] && { ASSUME_YES=1; unshape; }; restore_snapshot_values; rm -f "$CONFIG_FILE" "$SNAPSHOT_FILE" "$FACTS_FILE"; rmdir "$STATE_DIR" 2>/dev/null || true; ok '已恢复快照并清理本工具创建的持久化文件。'
 }
 menu() {
-  require_linux; line; say "VPS TCP 自适应调优器 v$VERSION"; line; yellow "1) 自适应测试并调优（需要可信 iperf3 对端）\n2) 按已知带宽/RTT 调优\n3) 仅检测\n4) 查看状态\n5) 回滚\n0) 退出\n"
+  require_linux; line; say "VPS TCP 自适应调优器 v$VERSION"; line
+  yellow "$(cat <<'EOF'
+1) 自适应测试并调优（需要可信 iperf3 对端）
+2) 按已知带宽/RTT 调优
+3) 仅检测
+4) 查看状态
+5) 回滚
+0) 退出
+EOF
+)"
+  printf '\n'
   local choice; yellow '[选择] '; read -r choice
   case "$choice" in
     1) yellow '[对端域名或 IPv4，回车自动选择公共节点] '; read -r PEER; yellow '[用途 general/proxy/server，默认 general] '; read -r ROLE; ROLE=${ROLE:-general}; auto ;;
