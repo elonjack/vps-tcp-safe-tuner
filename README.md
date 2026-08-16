@@ -105,10 +105,6 @@ sudo ./vps-tcp-tune.sh apply --bandwidth 1000 --rtt 150 --dry-run
 sudo ./vps-tcp-tune.sh rollback
 ```
 
-## 与 tcpfit 的定位
-
-`tcpfit` 的核心优点是 BDP、iperf3 和 policer 扫描。本项目同样采用“测量—推导—应用—验证”闭环，但使用用户指定的可信对端，并将会影响现网的 qdisc 整形置于显式能力之后。性能优劣必须以同一时间、同一对端、调优前后的吞吐和重传实测判断，不能靠参数数量判断。
-
 ## 开发
 
 ```bash
