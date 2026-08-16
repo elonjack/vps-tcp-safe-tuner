@@ -12,7 +12,7 @@
 | 多轮基准实验 | 同一对端多轮测试，使用中位吞吐减少偶发波动；记录重传、RTT 与估算流量 |
 | 自适应 BDP | 使用实测带宽和 RTT，按用途与内存限制推导 TCP 缓冲区 |
 | TCP 调优 | BBR、FQ 默认队列、收发缓冲区、MTU 探测、慢启动、backlog 与连接队列 |
-| 限速器处理 | 可选、明确确认的 HTB + FQ 整形；先扫描候选，绝不默认改活动 qdisc |
+| 限速器处理 | 可选、明确确认的 HTB + FQ 整形；以基线向上粗扫、拐点区间细扫、两轮复测候选 |
 | 性能保护 | 调优前后使用相同对端复测；吞吐明显退化或重传明显增加时默认自动回滚 |
 | 持久化与回滚 | 专属 sysctl/systemd 文件；首次变更前保存精确 sysctl 快照与实验报告 |
 
@@ -22,7 +22,7 @@
 - iperf3 缺失时才会询问是否安装系统包；绝不运行 `apt update`。
 - 默认不触碰正在运行的根 qdisc；整形必须额外使用 `--enable-shaping` 并确认。
 - 只接受域名或 IPv4 形式的对端，所有参数有范围校验。
-- 受限 OpenVZ/LXC、特殊 `mq` 根队列、无法安全恢复的 qdisc 会被拒绝。
+- 受限 OpenVZ/LXC、特殊 `mq` 根队列、无法精确重建的 qdisc 会被拒绝；支持的 `fq`、`fq_codel`、`pfifo*` 会保存根队列参数后恢复。
 - 终端提示为黄色；重定向日志时自动移除 ANSI 颜色。
 
 ## 支持范围
@@ -34,7 +34,7 @@
 一键安装固定版本。安装器会下载 GitHub Release 资产并在安装前校验 SHA-256：
 
 ```bash
-bash <(curl -fsSL https://raw.githubusercontent.com/elonjack/vps-tcp-safe-tuner/v3.0.0/install.sh)
+bash <(curl -fsSL https://raw.githubusercontent.com/elonjack/vps-tcp-safe-tuner/v3.1.0/install.sh)
 ```
 
 安装后可直接运行：
@@ -51,7 +51,7 @@ chmod 755 vps-tcp-tune.sh
 sudo ./vps-tcp-tune.sh audit
 ```
 
-直接一键调优时无需你另买 VPS：省略 `--peer` 后，脚本会从内置公共 iperf3 节点中按 RTT 自动选择可用对端。公共节点可能满载或临时不可用；这种情况下可稍后重试，或指定你自己的可信对端以获得更稳定的结果。
+直接一键调优时无需你另买 VPS：省略 `--peer` 后，脚本会从内置公共 iperf3 节点中按 RTT 排序、多个端口短测后选择可用对端。默认只接受 RTT 不超过 120 ms 的节点，可通过 `--peer-max-rtt` 调整。公共节点可能满载或临时不可用；这种情况下可稍后重试，或指定你自己的可信对端以获得更稳定的结果。
 
 最简单的一键调优：
 
@@ -87,7 +87,7 @@ sudo ./vps-tcp-tune.sh apply --bandwidth 1000 --rtt 150 --role proxy
 
 ## 限速器与整形
 
-只有出口 policer 导致重传或吞吐不稳时，整形才可能改善代理/大流吞吐。先使用同一可信对端完成 `auto`，再比较候选值：
+只有出口 policer 导致重传或吞吐不稳时，整形才可能改善代理/大流吞吐。启用 `--enable-shaping` 后，自动流程会以基线速率向上粗扫，遇到重传/吞吐拐点后在相邻区间逐 1 Mbit 细扫；每个候选均做两轮测试并在每轮后恢复原 qdisc。完成后只给出候选值，不会自动持久化整形。
 
 ```bash
 sudo ./vps-tcp-tune.sh shape --shape-rate 950 --enable-shaping

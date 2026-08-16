@@ -13,7 +13,12 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Bash 语法检查
-        run: bash -n vps-tcp-tune.sh
+        run: |
+          bash -n vps-tcp-tune.sh
+          bash -n install.sh
+          bash -n tests/test-shell.sh
+      - name: Shell 功能测试
+        run: bash tests/test-shell.sh
       - name: ShellCheck
         uses: ludeeus/action-shellcheck@2.0.0
         with:
