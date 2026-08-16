@@ -134,7 +134,7 @@ write_bbr_module_config() {
     warn "BBR 已临时加载；拒绝覆盖非本工具模块配置：$BBR_MODULE_FILE。"
     return 1
   fi
-  [[ -d $(dirname "$BBR_MODULE_FILE") ]] || mkdir -p -m 755 "$(dirname "$BBR_MODULE_FILE")"
+  [[ -d $(dirname "$BBR_MODULE_FILE") ]] || mkdir -p "$(dirname "$BBR_MODULE_FILE")"
   temporary_file=$(mktemp "${BBR_MODULE_FILE}.XXXXXX")
   { printf '%s\n' "$BBR_MODULE_MARKER"; printf '%s\n' 'tcp_bbr'; } >"$temporary_file"
   chmod 644 "$temporary_file"; mv -f "$temporary_file" "$BBR_MODULE_FILE"
