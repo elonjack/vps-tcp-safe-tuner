@@ -14,10 +14,10 @@ assert_equals() {
 assert_equals 1250 "$(rate_to_mbit 1.25 Gbits/sec)" 'Gbit 转 Mbit'
 assert_equals 1 "$(rate_to_mbit 1000 Kbits/sec)" 'Kbit 转 Mbit'
 
-BANDWIDTH_MBIT=284
-RTT_MS=150
-ROLE=general
-BUFFER_MULTIPLIER_OVERRIDE=''
+export BANDWIDTH_MBIT=284
+export RTT_MS=150
+export ROLE=general
+export BUFFER_MULTIPLIER_OVERRIDE=''
 assert_equals 10650000 "$(calculate_buffer)" '跨境 150ms BDP 缓冲区推导'
 
 parse_iperf_result '[SUM]   0.00-10.00  sec  1.10 GBytes   944 Mbits/sec    3             sender
