@@ -21,5 +21,9 @@ if ($content -notmatch 'calculate_initial_wmem') { throw 'Missing role-aware TCP
 if ($content -match 'add_setting net\.core\.(rmem_default|wmem_default)') { throw 'TCP defaults must not alter global socket defaults.' }
 if ($content -notmatch 'restore_legacy_core_defaults') { throw 'Missing v3.6.0 global default migration.' }
 if ($content -notmatch 'baseline_retrans \* 2 \+ 10') { throw 'Missing relative retransmission rollback guard.' }
+if ($content -notmatch 'transaction\.tsv') { throw 'Missing per-run transaction snapshot.' }
+if ($content -notmatch 'restore_transaction_values') { throw 'Missing per-run transaction restore.' }
+if ($content -notmatch 'run_measure_iperf') { throw 'Missing same-peer iperf3 port fallback.' }
+if ($content -notmatch 'active_htb_rate') { throw 'Missing active HTB rate detection.' }
 
 Write-Host 'Static security checks passed.'

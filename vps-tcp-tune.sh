@@ -6,9 +6,10 @@ set -Eeuo pipefail
 IFS=$'\n\t'
 umask 077
 
-readonly VERSION='3.7.0'
+readonly VERSION='3.8.0'
 readonly STATE_DIR='/var/lib/vps-tcp-safe-tuner'
 readonly SNAPSHOT_FILE="$STATE_DIR/baseline.tsv"
+readonly TRANSACTION_FILE="$STATE_DIR/transaction.tsv"
 readonly FACTS_FILE="$STATE_DIR/facts.tsv"
 readonly CONFIG_FILE='/etc/sysctl.d/99-vps-tcp-safe-tuner.conf'
 readonly LOCK_FILE='/run/lock/vps-tcp-safe-tuner.lock'
@@ -23,7 +24,7 @@ readonly AUTO_TARGET_RTT_MS='150'
 
 COMMAND='menu'; ROLE='general'; PEER=''; PEER_PORT='5201'; BANDWIDTH_MBIT=''; RTT_MS=''
 DURATION='12'; WORKERS='4'; ROUNDS='3'; POLICER_ROUNDS='3'; PEER_MAX_RTT='120'; BUFFER_MULTIPLIER_OVERRIDE=''; SHAPE_RATE=''; ENABLE_SHAPING=0; BUFFER_SEARCH=0; DRY_RUN=0; ASSUME_YES=0; NO_INSTALL=0; KEEP_ON_REGRESSION=0
-TUNING_APPLIED=0
+TUNING_APPLIED=0; DEFER_PERSIST=0; BBR_MODULE_CONFIG_CREATED=0
 
 # 第三方公开 iperf3 节点。自动模式会按 RTT 排序、依次做短测试；用户也可用 --peer 覆盖。
 # 节点可用性会变化，因此自动选择失败时会给出明确提示，不会伪造测量结果。
@@ -46,6 +47,7 @@ speedtest.chi11.us.leaseweb.net|芝加哥|Leaseweb
 speedtest.nyc1.us.leaseweb.net|纽约|Leaseweb
 speedtest.mia11.us.leaseweb.net|迈阿密|Leaseweb
 speedtest.mtl2.ca.leaseweb.net|蒙特利尔|Leaseweb'
+readonly -a IPERF_PORTS=(5201 5202 5203 5204 5205 5206 5207 5208 5209 5210 5200)
 
 yellow() { if [[ -t 1 ]]; then printf '\033[1;33m%s\033[0m' "$*"; else printf '%s' "$*"; fi; }
 say() { yellow "[信息] $*"; printf '\n'; }
@@ -152,10 +154,16 @@ ensure_bbr() {
   modprobe tcp_bbr 2>/dev/null || fail '无法加载 tcp_bbr；商家内核可能未提供该模块，工具不会下载模块或替换内核。'
   kernel_supports_bbr || fail 'tcp_bbr 已尝试加载，但内核仍未提供 BBR；已停止调优。'
   if write_bbr_module_config; then
+    BBR_MODULE_CONFIG_CREATED=1
     ok 'BBR 已启用；本工具会在重启后自动加载 tcp_bbr。'
   else
     warn 'BBR 已在本次启动中启用；因同名模块配置不归本工具管理，未改动其重启加载行为。'
   fi
+}
+cleanup_candidate_bbr() {
+  (( BBR_MODULE_CONFIG_CREATED )) || return 0
+  remove_bbr_module_config
+  BBR_MODULE_CONFIG_CREATED=0
 }
 memory_mib() { awk '/MemTotal:/ {print int($2 / 1024)}' /proc/meminfo; }
 default_interface() { ip route show default 2>/dev/null | awk 'NR == 1 {for (i=1;i<=NF;i++) if ($i=="dev") {print $(i+1); exit}}'; }
@@ -176,7 +184,6 @@ validate_peer() { [[ -n $PEER ]] || fail '未取得可用 iperf3 对端。'; [[ 
 
 auto_pick_peer() {
   local candidate location provider rtt ranked host port probe
-  local -a ports=(5201 5202 5203 5204 5205 5206 5207 5208 5209 5210 5200)
   say '未指定 --peer，正在从内置公共 iperf3 节点中自动选择可用且 RTT 较低的对端。'
   command -v ping >/dev/null 2>&1 || warn '未安装 ping，将按节点顺序测试；建议安装 iputils-ping 以获得更准确的自动选择。'
   ranked=''
@@ -196,7 +203,7 @@ auto_pick_peer() {
       continue
     fi
     say "尝试公共节点：$location / $provider（RTT 约 ${rtt}ms）。"
-    for port in "${ports[@]}"; do
+    for port in "${IPERF_PORTS[@]}"; do
       # 先只做 TCP 握手；避免对每个端口都跑秒级满速 iperf3 测试。
       timeout 4 bash -c 'cat < /dev/null > "/dev/tcp/$1/$2"' _ "$host" "$port" 2>/dev/null || continue
       probe=$(timeout 8 iperf3 -c "$host" -p "$port" -P 1 -t 2 2>&1) || continue
@@ -226,7 +233,7 @@ ensure_iperf3() {
 rate_to_mbit() {
   awk -v n="$1" -v u="$2" 'BEGIN {if(u~/^K/)n=n/1000; else if(u~/^G/)n=n*1000; else if(u~/^T/)n=n*1000000; printf "%.0f",n}'
 }
-MEASURE_RATE=''; MEASURE_RETRANS=''; MEASURE_RTT=''; MEASURE_OUTPUT=''
+MEASURE_RATE=''; MEASURE_RETRANS=''; MEASURE_RTT=''; MEASURE_FAILURE=''
 
 measure_rtt() {
   MEASURE_RTT=''; command -v ping >/dev/null 2>&1 || return 0
@@ -241,6 +248,31 @@ parse_iperf_result() {
   raw_rate=${raw%% *}; raw_unit=${raw##* }; MEASURE_RATE=$(rate_to_mbit "$raw_rate" "$raw_unit")
   MEASURE_RETRANS=$(awk '$NF == "sender" {value=$(NF-1)} END{if(value!="")print value;else print 0}' <<<"$output")
 }
+compact_iperf_error() {
+  awk 'NF {line=$0} END {gsub(/[[:cntrl:]]/, " ", line); if (line != "") print substr(line, 1, 180)}' <<<"$1"
+}
+run_measure_iperf() {
+  local port output last_error='' seen=''
+  MEASURE_FAILURE=''
+  for port in "$PEER_PORT" "${IPERF_PORTS[@]}"; do
+    [[ " $seen " == *" $port "* ]] && continue
+    seen+=" $port"
+    output=$(timeout "$(( DURATION + 15 ))" iperf3 -c "$PEER" -p "$port" -P "$WORKERS" -t "$DURATION" --omit 2 2>&1) || {
+      last_error=$(compact_iperf_error "$output")
+      continue
+    }
+    if parse_iperf_result "$output"; then
+      if [[ $port != "$PEER_PORT" ]]; then
+        warn "对端端口 $PEER_PORT 不可用，已切换到同一对端的可用端口 $port。"
+        PEER_PORT=$port
+      fi
+      return 0
+    fi
+    last_error=$(compact_iperf_error "$output")
+  done
+  MEASURE_FAILURE=${last_error:-"对端 $PEER 的全部 iperf3 端口无响应或测试超时"}
+  return 1
+}
 measure() {
   require_linux; require_command timeout; validate_common; ensure_iperf3
   [[ -n $PEER ]] || auto_pick_peer
@@ -253,12 +285,8 @@ measure() {
   say "开始 ${ROUNDS} 轮测试：对端=$PEER:$PEER_PORT，并发=$WORKERS，单轮=${DURATION}s。"
   say '测试会产生实际流量；为降低偶发波动影响，最终使用有效轮次的中位吞吐。'
   for ((round = 1; round <= ROUNDS; round += 1)); do
-    MEASURE_OUTPUT=$(timeout "$(( DURATION + 15 ))" iperf3 -c "$PEER" -p "$PEER_PORT" -P "$WORKERS" -t "$DURATION" --omit 2 2>&1) || {
-      warn "第 $round 轮测试失败，已跳过。"
-      continue
-    }
-    if ! parse_iperf_result "$MEASURE_OUTPUT"; then
-      warn "第 $round 轮输出无法解析，已跳过。"
+    if ! run_measure_iperf; then
+      warn "第 $round 轮测试失败（已尝试同一对端的备用端口）：$MEASURE_FAILURE"
       continue
     fi
     rate=$MEASURE_RATE; retrans=$MEASURE_RETRANS
@@ -268,7 +296,8 @@ measure() {
   done
   if (( valid < required )); then
     rm -f "$temporary_file"
-    fail "仅 $valid/$ROUNDS 轮测试有效，少于所需的 $required 轮；拒绝据此调优。"
+    warn "仅 $valid/$ROUNDS 轮测试有效，少于所需的 $required 轮；拒绝据此调优。"
+    return 1
   fi
   median_position=$(( (valid + 1) / 2 ))
   MEASURE_RATE=$(sort -n -k 1,1 "$temporary_file" | awk -v position="$median_position" 'NR == position {print $1}')
@@ -343,11 +372,21 @@ build_settings() {
   ((${#KEYS[@]})) || fail '没有可写入的调优项。'
 }
 
+active_root_qdisc() { tc qdisc show dev "$1" 2>/dev/null | awk 'NR == 1 {print $2}'; }
+active_htb_rate() { tc class show dev "$1" 2>/dev/null | awk '{for (i = 1; i <= NF; i += 1) if ($i == "rate") {print $(i + 1); exit}}'; }
 show_environment() {
-  local iface
+  local iface root_qdisc htb_rate
   iface=$(default_interface); line; say "版本：$VERSION；内核：$(uname -r)；虚拟化：$(virtualization)"
   say "内存：$(memory_mib) MiB；默认网卡：${iface:-未检测到}"; say "拥塞控制：$(sysctl_value net.ipv4.tcp_congestion_control)；默认 qdisc：$(sysctl_value net.core.default_qdisc)"
-  [[ -z $iface ]] || say "活动根 qdisc：$(tc qdisc show dev "$iface" 2>/dev/null | awk 'NR==1 {print $2}')"; line
+  if [[ -n $iface ]]; then
+    root_qdisc=$(active_root_qdisc "$iface")
+    say "活动根 qdisc：${root_qdisc:-未检测到}"
+    if [[ $root_qdisc == htb ]]; then
+      htb_rate=$(active_htb_rate "$iface")
+      warn "检测到已有 HTB 出向整形（首个 class rate：${htb_rate:-未取得}）。本工具不会覆盖它；实际出站速度仍受该整形限制。"
+    fi
+  fi
+  line
 }
 show_plan() {
   local i buffer initial_rmem initial_wmem; buffer=$(calculate_buffer); initial_rmem=$(calculate_initial_rmem "$buffer"); initial_wmem=$(calculate_initial_wmem "$buffer"); show_environment
@@ -370,6 +409,21 @@ snapshot_if_needed() {
   done
   if [[ ! -f $SNAPSHOT_FILE || $changed -eq 1 ]]; then mv -f "$tmp" "$SNAPSHOT_FILE"; else rm -f "$tmp"; fi
 }
+snapshot_transaction() {
+  install -d -m 700 "$STATE_DIR"
+  local tmp i
+  tmp=$(mktemp "$STATE_DIR/transaction.XXXXXX"); chmod 600 "$tmp"
+  for i in "${!KEYS[@]}"; do printf '%s\t%s\n' "${KEYS[$i]}" "$(sysctl_value "${KEYS[$i]}")" >>"$tmp"; done
+  mv -f "$tmp" "$TRANSACTION_FILE"
+}
+restore_transaction_values() {
+  local key value
+  [[ -f $TRANSACTION_FILE ]] || return 0
+  while IFS=$'\t' read -r key value; do
+    [[ -z $key ]] || { sysctl_exists "$key" && sysctl -q -w "$key=$value" || warn "恢复本次修改前的 $key 失败。"; }
+  done <"$TRANSACTION_FILE"
+}
+discard_transaction() { rm -f "$TRANSACTION_FILE"; }
 write_facts() {
   install -d -m 700 "$STATE_DIR"
   { printf 'role\t%s\n' "$ROLE"; printf 'bandwidth_mbit\t%s\n' "$BANDWIDTH_MBIT"; printf 'target_rtt_ms\t%s\n' "$RTT_MS"; printf 'test_peer_rtt_ms\t%s\n' "${MEASURE_RTT:-}"; printf 'buffer_bdp_multiplier\t%s\n' "${BUFFER_MULTIPLIER_OVERRIDE:-default}"; printf 'tcp_initial_rmem\t%s\n' "$(calculate_initial_rmem "$(calculate_buffer)")"; printf 'tcp_initial_wmem\t%s\n' "$(calculate_initial_wmem "$(calculate_buffer)")"; printf 'peer\t%s\n' "$PEER"; printf 'measured_mbit\t%s\n' "${MEASURE_RATE:-}"; printf 'measured_retrans\t%s\n' "${MEASURE_RETRANS:-}"; } >"$FACTS_FILE"
@@ -394,7 +448,9 @@ write_experiment_report() {
     printf 'baseline_retrans\t%s\n' "$baseline_retrans"
     printf 'after_mbit\t%s\n' "$after_rate"
     printf 'after_retrans\t%s\n' "$after_retrans"
-    awk -v before="$baseline_rate" -v after="$after_rate" 'BEGIN {if (before > 0) printf "gain_percent\t%.2f\n", (after-before)*100/before}'
+    if [[ $after_rate =~ ^[0-9]+$ ]]; then
+      awk -v before="$baseline_rate" -v after="$after_rate" 'BEGIN {if (before > 0) printf "gain_percent\t%.2f\n", (after-before)*100/before}'
+    fi
   } >"$report_file"
   chmod 600 "$report_file"
   say "实验报告：$report_file"
@@ -407,11 +463,9 @@ is_material_regression() {
   return 1
 }
 revert_auto_experiment() {
-  warn '复测显示明显退化，正在恢复本次 TCP 参数。'
-  restore_snapshot_values
-  remove_bbr_module_config; rm -f "$CONFIG_FILE" "$FACTS_FILE" "$SNAPSHOT_FILE"
-  rmdir "$STATE_DIR" 2>/dev/null || true
-  ok '已自动回滚本次实验参数；实验报告仍保留。'
+  warn '复测失败或出现明显退化，正在恢复本次应用前的 TCP 参数。'
+  restore_transaction_values; cleanup_candidate_bbr; discard_transaction
+  ok '已恢复本次实验前的参数；实验报告仍保留。'
 }
 write_config() {
   local tmp i; tmp=$(mktemp "${CONFIG_FILE}.XXXXXX"); chmod 644 "$tmp"
@@ -447,17 +501,22 @@ apply_tuning() {
   (( DRY_RUN )) && { ok '预览完成，未修改系统。'; return 0; }; confirm '将自动启用内核已有的 BBR（如尚未加载）、写入 sysctl、保存精确快照并立即应用自适应 TCP 参数。继续吗？' || { say '已取消。'; return 0; }
   ensure_bbr
   snapshot_if_needed
+  snapshot_transaction
   if ! restore_legacy_core_defaults; then
-    warn '旧版全局 socket 默认值恢复失败，正在恢复首次快照。'
-    restore_snapshot_values; remove_bbr_module_config
-    fail '调优失败，已执行回滚。'
+    warn '旧版全局 socket 默认值恢复失败，正在恢复本次应用前参数。'
+    restore_transaction_values; discard_transaction; cleanup_candidate_bbr
+    fail '调优失败，已恢复本次应用前参数。'
   fi
   if ! apply_built_settings; then
-    warn '候选 sysctl 应用失败，正在恢复首次快照。'
-    restore_snapshot_values; remove_bbr_module_config
-    fail '调优失败，已执行回滚。'
+    warn '候选 sysctl 应用失败，正在恢复本次应用前参数。'
+    restore_transaction_values; discard_transaction; cleanup_candidate_bbr
+    fail '调优失败，已恢复本次应用前参数。'
   fi
-  write_config; write_facts; TUNING_APPLIED=1; ok "已应用 ${#KEYS[@]} 项自适应 TCP 设置。"
+  if (( DEFER_PERSIST )); then
+    TUNING_APPLIED=1; ok "已临时应用 ${#KEYS[@]} 项候选 TCP 设置，复测通过后才会持久化。"
+  else
+    write_config; write_facts; discard_transaction; TUNING_APPLIED=1; ok "已应用 ${#KEYS[@]} 项自适应 TCP 设置。"
+  fi
 }
 search_buffer_candidates() {
   local saved_override=$BUFFER_MULTIPLIER_OVERRIDE saved_rounds=$ROUNDS candidate candidate_rate candidate_retrans best_multiplier='' best_rate=0 best_retrans=0
@@ -472,7 +531,10 @@ search_buffer_candidates() {
       warn "${candidate}× BDP 参数无法应用，已跳过。"
       continue
     fi
-    measure
+    if ! measure; then
+      warn "${candidate}× BDP 的测量不足，已跳过该候选。"
+      continue
+    fi
     candidate_rate=$MEASURE_RATE; candidate_retrans=$MEASURE_RETRANS
     say "${candidate}× BDP：中位吞吐 ${candidate_rate}Mbit，累计重传 ${candidate_retrans}。"
     if (( candidate_retrans <= 10 && candidate_rate > best_rate )); then
@@ -483,14 +545,13 @@ search_buffer_candidates() {
   if [[ -z $best_multiplier ]]; then
     BUFFER_MULTIPLIER_OVERRIDE=$saved_override
     build_settings
-    apply_built_settings || { restore_snapshot_values; fail '所有缓冲区候选均失败，已恢复快照。'; }
+    apply_built_settings || { restore_transaction_values; fail '所有缓冲区候选均失败，已恢复本次应用前参数。'; }
     warn '没有重传可接受的缓冲区候选，已恢复搜索前配置。'
     return 0
   fi
   BUFFER_MULTIPLIER_OVERRIDE=$best_multiplier
   build_settings
-  apply_built_settings || { restore_snapshot_values; fail '最佳缓冲区候选应用失败，已恢复快照。'; }
-  write_config
+  apply_built_settings || { restore_transaction_values; fail '最佳缓冲区候选应用失败，已恢复本次应用前参数。'; }
   say "已选择 ${best_multiplier}× BDP 缓冲区：${best_rate}Mbit，累计重传 ${best_retrans}。"
 }
 
@@ -684,7 +745,9 @@ auto() {
   local baseline_rate baseline_retrans after_rate after_retrans decision
   require_root; require_linux; validate_common
   say '阶段 1/3：记录调优前基线。'
-  measure
+  if ! measure; then
+    fail '调优前基线不足，未改动系统。请稍后重试或指定可信 iperf3 对端。'
+  fi
   baseline_rate=$MEASURE_RATE; baseline_retrans=$MEASURE_RETRANS
   BANDWIDTH_MBIT=$MEASURE_RATE
   if [[ -z $RTT_MS ]]; then
@@ -695,14 +758,22 @@ auto() {
   fi
   derive_network_facts
   say '阶段 2/3：应用按基线推导的候选配置。'
+  DEFER_PERSIST=1
   apply_tuning
+  DEFER_PERSIST=0
   (( TUNING_APPLIED )) || { say '候选配置未应用，已结束实验。'; return 0; }
   if (( BUFFER_SEARCH )); then
     say '附加阶段：搜索当前线路更合适的 BDP 缓冲区倍率。'
     search_buffer_candidates
   fi
   say '阶段 3/3：使用同一对端、同一轮次复测。'
-  measure
+  if ! measure; then
+    decision='rolled_back_unverified'
+    write_experiment_report "$baseline_rate" "$baseline_retrans" '' '' "$decision"
+    warn "复测不足，候选参数不予保留。最后一次 iperf3 错误：${MEASURE_FAILURE:-未取得}"
+    revert_auto_experiment
+    return 0
+  fi
   after_rate=$MEASURE_RATE; after_retrans=$MEASURE_RETRANS
   decision='retained'
   if is_material_regression "$baseline_rate" "$baseline_retrans" "$after_rate" "$after_retrans"; then
@@ -718,7 +789,7 @@ auto() {
     revert_auto_experiment
     return 0
   fi
-  write_facts
+  write_config; write_facts; discard_transaction
   ok '复测未出现明显退化，已保留候选 TCP 配置。'
   if (( ENABLE_SHAPING )); then
     if [[ $MEASURE_RETRANS == 0 ]]; then say '验证无重传，跳过限速器扫描。';
@@ -737,11 +808,12 @@ status() {
   [[ -f $CONFIG_FILE ]] && { say "持久化配置：$CONFIG_FILE"; yellow "$(sed -n '1,30p' "$CONFIG_FILE")"; printf '\n'; } || warn '未检测到本工具 sysctl 配置。'
   [[ -f $FACTS_FILE ]] && { say '上次调优事实：'; yellow "$(cat "$FACTS_FILE")"; printf '\n'; }
   [[ -f $SNAPSHOT_FILE ]] && say "可回滚快照：$SNAPSHOT_FILE" || say '没有 sysctl 快照。'; [[ -f $SHAPE_STATE ]] && say "已存在本工具整形：$(tr '\t' ' ' <"$SHAPE_STATE")" || say '没有本工具整形。'
+  if [[ -f $TRANSACTION_FILE ]]; then warn '检测到未完成的调优事务；请重新运行调优或执行回滚后再继续。'; fi
 }
 rollback() {
   require_root; require_linux; require_command sysctl; lock; [[ -f $SNAPSHOT_FILE ]] || fail '未找到首次快照；拒绝猜测系统原始值。'
   (( DRY_RUN )) && { say '将恢复 sysctl 快照并移除本工具配置和整形。'; return 0; }; confirm '恢复首次 sysctl 快照并移除本工具的持久化配置/整形吗？' || { say '已取消。'; return 0; }
-  [[ -f $SHAPE_STATE ]] && { ASSUME_YES=1; unshape; }; restore_snapshot_values; remove_bbr_module_config; rm -f "$CONFIG_FILE" "$SNAPSHOT_FILE" "$FACTS_FILE"; rmdir "$STATE_DIR" 2>/dev/null || true; ok '已恢复快照并清理本工具创建的持久化文件。'
+  [[ -f $SHAPE_STATE ]] && { ASSUME_YES=1; unshape; }; restore_snapshot_values; remove_bbr_module_config; rm -f "$CONFIG_FILE" "$SNAPSHOT_FILE" "$FACTS_FILE" "$TRANSACTION_FILE"; rmdir "$STATE_DIR" 2>/dev/null || true; ok '已恢复快照并清理本工具创建的持久化文件。'
 }
 menu() {
   require_linux; line; say "VPS TCP 自适应调优器 v$VERSION"; line

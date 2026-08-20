@@ -29,8 +29,13 @@ parse_iperf_result '[SUM]   0.00-10.00  sec  1.10 GBytes   944 Mbits/sec    3   
 [SUM]   0.00-10.00  sec  1.08 GBytes   928 Mbits/sec                  receiver'
 assert_equals 928 "$MEASURE_RATE" 'iperf3 接收吞吐解析'
 assert_equals 3 "$MEASURE_RETRANS" 'iperf3 重传解析'
+assert_equals 'iperf3: error - the server is busy' "$(compact_iperf_error $'notice\niperf3: error - the server is busy\n')" 'iperf3 错误摘要'
 
 tc() {
+  if [[ $1 == class && $2 == show ]]; then
+    printf '%s\n' 'class htb 1:10 root rate 200Mbit ceil 200Mbit burst 1600b cburst 1600b'
+    return 0
+  fi
   if [[ $1 == qdisc && $2 == show ]]; then
     if [[ ${TC_FIXTURE:-single} == mq ]]; then
       printf '%s\n' 'qdisc mq 0: root'
@@ -41,6 +46,7 @@ tc() {
     fi
   fi
 }
+assert_equals 200Mbit "$(active_htb_rate eth0)" 'HTB 限速读取'
 snapshot=$(qdisc_snapshot eth0)
 assert_equals $'fq_codel\tlimit 2048p flows 512 target 5.0ms interval 100.0ms ecn' "$snapshot" 'qdisc 参数快照'
 
