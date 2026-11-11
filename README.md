@@ -16,16 +16,24 @@
 | 限速器处理 | 可选、明确确认的 HTB + FQ 整形；基线噪声感知的 85%–145% 粗扫、三轮复测、二分精扫与安全余量建议 |
 | 多队列恢复 | 保存常见单根 qdisc 参数；对常见 `mq` 多队列根同时保存每个可恢复叶子队列并逐个恢复 |
 | 性能保护 | 调优前后使用相同对端复测；吞吐明显退化或重传明显增加时默认自动回滚 |
-| 持久化与回滚 | 专属 sysctl/systemd 文件；首次变更前保存精确 sysctl 快照与实验报告 |
+| 流量护栏 | 单阶段默认最多估算 20 GiB；超限必须显式使用 `--allow-high-traffic`，`--yes` 不能代替授权 |
+| 持久化与回滚 | 专属 sysctl/systemd 文件；首次变更前保存精确 sysctl 快照与实验报告；恢复不完整时保留快照 |
 
 ## 安全设计
 
-- 不使用 `curl | bash`，不下载或执行远程代码。
+- 主调优脚本不下载或执行远程代码，不包含运行统计、遥测、广告请求或作者控制的回传地址。
 - iperf3 缺失时才会询问是否安装系统包；绝不运行 `apt update`。
+- 不指定 `--peer` 时，使用第三方公共测速节点前必须交互确认；无人值守运行必须显式加入 `--allow-public-peers`。`--yes` 不会绕过这项外联授权。
 - 默认不触碰正在运行的根 qdisc；整形必须额外使用 `--enable-shaping` 并确认。
-- 只接受域名或 IPv4 形式的对端，所有参数有范围校验。
+- 对端、速率、轮次及写入持久化脚本的网卡名均有范围或字符校验。
+- 写入 `/usr/local/sbin` 和 `/etc/systemd/system` 前检查所有权标记，拒绝覆盖同名的第三方文件；systemd 整形单元限制文件系统访问和 Linux capability。
 - 受限 OpenVZ/LXC、无法精确重建的自定义 qdisc 会被拒绝；支持的 `fq`、`fq_codel`、`pfifo*` 会保存参数后恢复，常见 `mq` 多队列会额外保存并恢复每个受支持的叶子队列。
+- 回滚只有在所有受管 sysctl 都恢复成功后才删除快照；部分失败时保留证据并返回错误。
 - 终端提示为黄色；重定向日志时自动移除 ANSI 颜色。
+
+主脚本可能发生的外联只有用户请求的 iperf3/ping/TCP 测速，以及经确认后由系统包管理器安装 iperf3。安装器仅连接固定的 GitHub Release URL。对端和中间网络仍然能看到 VPS 的源 IP，因此涉及敏感机器时应使用自有 iperf3 对端。
+
+对参考项目 tcpfit v0.5.9 的逐项静态审阅见 [SECURITY-REVIEW-tcpfit.md](SECURITY-REVIEW-tcpfit.md)。
 
 ## 支持范围
 
@@ -33,10 +41,19 @@
 
 ## 快速开始
 
-一键安装固定版本。安装器会下载 GitHub Release 资产并在安装前校验 SHA-256：
+发布 v4.0.0 tag 并上传同名 Release 资产后，推荐先下载固定版本、检查内容，再运行安装器。安装器会再次用内置 SHA-256 校验固定的 GitHub Release 资产：
 
 ```bash
-bash <(curl -fsSL https://raw.githubusercontent.com/elonjack/vps-tcp-safe-tuner/v3.8.0/install.sh)
+curl -fLO https://raw.githubusercontent.com/elonjack/vps-tcp-safe-tuner/v4.0.0/install.sh
+less install.sh
+bash install.sh
+```
+
+在发布前或已经下载完整仓库时，可完全避免安装阶段再次联网；`--local` 仍会核对安装器内置哈希：
+
+```bash
+sha256sum -c SHA256SUMS
+sudo bash install.sh --local ./vps-tcp-tune.sh
 ```
 
 在交互终端中，安装完成会自动打开中文菜单；选择 1 即可完成测量、自动加载内核已有的 BBR、应用与复测。也可之后手动运行：
@@ -53,7 +70,7 @@ chmod 755 vps-tcp-tune.sh
 sudo ./vps-tcp-tune.sh audit
 ```
 
-直接一键调优时无需你另买 VPS：省略 `--peer` 后，脚本会从内置公共 iperf3 节点中按 RTT 排序、多个端口短测后选择可用对端。默认只接受 RTT 不超过 120 ms 的节点，可通过 `--peer-max-rtt` 调整。公共节点可能满载或临时不可用；这种情况下可稍后重试，或指定你自己的可信对端以获得更稳定的结果。
+省略 `--peer` 后，脚本可从内置公共 iperf3 节点中按 RTT 排序、多个端口短测后选择可用对端。交互运行会先说明第三方外联并询问授权；非交互运行必须明确添加 `--allow-public-peers`。默认只接受 RTT 不超过 120 ms 的节点，可通过 `--peer-max-rtt` 调整。公共节点可能满载或临时不可用；推荐指定自有或可信对端以获得更稳定的结果。
 
 最简单的一键调优：
 
@@ -64,7 +81,7 @@ sudo vps-tcp-tune
 也可以明确使用自动公共节点：
 
 ```bash
-sudo vps-tcp-tune auto --role proxy --rounds 3
+sudo vps-tcp-tune auto --role proxy --rounds 3 --allow-public-peers
 ```
 
 若需最可重复、最贴近业务目标的测量，推荐准备一台自有或可信的 iperf3 服务端：
@@ -79,7 +96,7 @@ iperf3 -s
 sudo ./vps-tcp-tune.sh auto --peer YOUR_IPERF3_HOST --role proxy
 ```
 
-该流程会先记录 3 轮基准、显示推导参数、确认后自动尝试 `modprobe tcp_bbr`，并以本工具专属配置让 BBR 在重启后加载，再应用参数并以同一对端复测 3 轮。自动测速会优先选近端以测出端口可用带宽，但**不会**把近端 RTT 用作跨境业务的 BDP：默认按 150 ms 业务目标 RTT 推导缓冲区。若实际用户主要在其他方向，可用 `--rtt` 覆盖，例如 `auto --rtt 180`。若内核确实没有 BBR 模块，工具会停止而不会下载模块或更换内核。若吞吐下降超过 15%、原本零重传而复测累计出现超过 10 次重传，或已有重传的情况下复测重传翻倍且超过 10 次容差，默认自动回滚。若复测对端不可用、有效轮次不足，候选参数不会持久化，脚本会恢复本次应用前的参数并显示最后一次 iperf3 错误。测速会优先尝试同一对端的备用端口，避免因为单个公共端口繁忙而误判。测速会消耗流量，默认每轮为 4 流、12 秒；可用 `--rounds 1` 到 `--rounds 5` 调整。
+该流程会先记录 3 轮基准、显示推导参数、确认后自动尝试 `modprobe tcp_bbr`，并以本工具专属配置让 BBR 在重启后加载，再应用参数并以同一对端复测 3 轮。自动测速会优先选近端以测出端口可用带宽，但**不会**把近端 RTT 用作跨境业务的 BDP：默认按 150 ms 业务目标 RTT 推导缓冲区。若实际用户主要在其他方向，可用 `--rtt` 覆盖，例如 `auto --rtt 180`。若内核确实没有 BBR 模块，工具会停止而不会下载模块或更换内核。若吞吐下降超过 15%、原本零重传而复测累计出现超过 10 次重传，或已有重传的情况下复测重传翻倍且超过 10 次容差，默认自动回滚。若复测对端不可用、有效轮次不足，候选参数不会持久化，脚本会恢复本次应用前的参数并显示最后一次 iperf3 错误。测速会优先尝试同一对端的备用端口，避免因为单个公共端口繁忙而误判。测速会消耗流量，默认每轮为 4 流、12 秒；可用 `--rounds 1` 到 `--rounds 5` 调整。已知带宽后，每个阶段会先估算流量，默认超过 20 GiB 就拒绝发送；可用 `--max-test-gib` 调低上限，或在确认套餐流量充足后显式加入 `--allow-high-traffic`。
 
 ### 代理加速应怎样选择
 
@@ -92,7 +109,7 @@ sudo ./vps-tcp-tune.sh auto --peer YOUR_IPERF3_HOST --role proxy
 如需进一步针对当前线路搜索缓冲区上限，可显式启用 A/B 搜索。该模式会额外进行 3 组、每组 2 轮测试，因此仅建议在流量充足且业务低峰时使用：
 
 ```bash
-sudo vps-tcp-tune auto --role proxy --search-buffers
+sudo vps-tcp-tune auto --role proxy --search-buffers --allow-public-peers
 ```
 
 如果已知出口带宽与典型 RTT：

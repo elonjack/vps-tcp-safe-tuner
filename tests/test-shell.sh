@@ -14,6 +14,23 @@ assert_equals() {
 assert_equals 1250 "$(rate_to_mbit 1.25 Gbits/sec)" 'Gbit 转 Mbit'
 assert_equals 1 "$(rate_to_mbit 1000 Kbits/sec)" 'Kbit 转 Mbit'
 
+is_safe_iface eth0 || { printf '常规网卡名校验失败。\n' >&2; exit 1; }
+is_safe_iface 'ens3.100' || { printf 'VLAN 网卡名校验失败。\n' >&2; exit 1; }
+if is_safe_iface "eth0';touch /tmp/pwn"; then printf '危险网卡名未被拒绝。\n' >&2; exit 1; fi
+
+export DURATION=12 MAX_TEST_GIB=1 ALLOW_HIGH_TRAFFIC=0
+if guard_test_traffic '测试流量护栏' 10000 3 >/dev/null 2>&1; then printf '高流量护栏未生效。\n' >&2; exit 1; fi
+export ALLOW_HIGH_TRAFFIC=1
+guard_test_traffic '测试流量护栏' 10000 3 >/dev/null 2>&1 || { printf '显式高流量授权未生效。\n' >&2; exit 1; }
+export MAX_TEST_GIB=20 ALLOW_HIGH_TRAFFIC=0
+
+parse_options --peer-max-rtt 80 --max-test-gib 5 --allow-public-peers --allow-high-traffic
+assert_equals 80 "$PEER_MAX_RTT" '公共节点 RTT 参数解析'
+assert_equals 5 "$MAX_TEST_GIB" '流量上限参数解析'
+assert_equals 1 "$ALLOW_PUBLIC_PEERS" '公共节点显式授权参数解析'
+assert_equals 1 "$ALLOW_HIGH_TRAFFIC" '高流量显式授权参数解析'
+export PEER_MAX_RTT=120 MAX_TEST_GIB=20 ALLOW_PUBLIC_PEERS=0 ALLOW_HIGH_TRAFFIC=0
+
 export BANDWIDTH_MBIT=284
 export RTT_MS=150
 export ROLE=general

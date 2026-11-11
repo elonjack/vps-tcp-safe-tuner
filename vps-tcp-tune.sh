@@ -6,7 +6,7 @@ set -Eeuo pipefail
 IFS=$'\n\t'
 umask 077
 
-readonly VERSION='3.8.0'
+readonly VERSION='4.0.0'
 readonly STATE_DIR='/var/lib/vps-tcp-safe-tuner'
 readonly SNAPSHOT_FILE="$STATE_DIR/baseline.tsv"
 readonly TRANSACTION_FILE="$STATE_DIR/transaction.tsv"
@@ -20,10 +20,12 @@ readonly BBR_MODULE_FILE='/etc/modules-load.d/vps-tcp-safe-tuner-bbr.conf'
 readonly REPORT_DIR='/var/log/vps-tcp-safe-tuner'
 readonly MARKER='# Managed by vps-tcp-safe-tuner. Remove only with vps-tcp-tune rollback.'
 readonly BBR_MODULE_MARKER='# Managed by vps-tcp-safe-tuner: load BBR at boot.'
+readonly SHAPE_SCRIPT_MARKER='# Managed by vps-tcp-safe-tuner: egress shaper helper.'
+readonly SHAPE_UNIT_MARKER='# Managed by vps-tcp-safe-tuner: egress shaper unit.'
 readonly AUTO_TARGET_RTT_MS='150'
 
 COMMAND='menu'; ROLE='general'; PEER=''; PEER_PORT='5201'; BANDWIDTH_MBIT=''; RTT_MS=''
-DURATION='12'; WORKERS='4'; ROUNDS='3'; POLICER_ROUNDS='3'; PEER_MAX_RTT='120'; BUFFER_MULTIPLIER_OVERRIDE=''; SHAPE_RATE=''; ENABLE_SHAPING=0; BUFFER_SEARCH=0; DRY_RUN=0; ASSUME_YES=0; NO_INSTALL=0; KEEP_ON_REGRESSION=0
+DURATION='12'; WORKERS='4'; ROUNDS='3'; POLICER_ROUNDS='3'; PEER_MAX_RTT='120'; MAX_TEST_GIB='20'; BUFFER_MULTIPLIER_OVERRIDE=''; SHAPE_RATE=''; ENABLE_SHAPING=0; BUFFER_SEARCH=0; DRY_RUN=0; ASSUME_YES=0; NO_INSTALL=0; KEEP_ON_REGRESSION=0; ALLOW_PUBLIC_PEERS=0; ALLOW_HIGH_TRAFFIC=0
 TUNING_APPLIED=0; DEFER_PERSIST=0; BBR_MODULE_CONFIG_CREATED=0
 
 # 第三方公开 iperf3 节点。自动模式会按 RTT 排序、依次做短测试；用户也可用 --peer 覆盖。
@@ -83,6 +85,9 @@ vps-tcp-tune - 自适应 Linux VPS TCP 调优工具
   --rounds N           每个阶段的独立测试轮数，默认 3，范围 1 到 5
   --policer-rounds N   每个限速器候选的测试轮数，默认 3，范围 2 到 5
   --peer-max-rtt MS    自动选择公共对端的最大 RTT，默认 120 ms
+  --allow-public-peers 明确允许探测并测速内置第三方公共节点；非交互自动选择时必需
+  --max-test-gib N     单个阶段允许的估算流量上限，默认 20 GiB
+  --allow-high-traffic 明确允许超过流量上限；--yes 不会代替此授权
   --enable-shaping     auto 成功后，允许进入限速器扫描和整形候选流程
   --search-buffers     对 1×、2×、3× BDP 缓冲区进行 A/B 测试并自动保留最佳候选
   --shape-rate MBIT    shape 使用的目标速率
@@ -108,6 +113,8 @@ require_root() { [[ ${EUID:-$(id -u)} -eq 0 ]] || fail '需要 root 权限，请
 require_linux() { [[ $(uname -s) == Linux ]] || fail '仅支持 Linux。'; }
 require_command() { command -v "$1" >/dev/null 2>&1 || fail "缺少必要命令：$1"; }
 is_positive_integer() { [[ ${1:-} =~ ^[1-9][0-9]*$ ]]; }
+is_safe_iface() { [[ ${1:-} =~ ^[A-Za-z0-9_.-]{1,15}$ ]]; }
+validate_iface() { is_safe_iface "$1" || fail "网卡名不安全或无效：${1:-<空>}"; }
 
 confirm() {
   local message=$1 answer
@@ -177,6 +184,7 @@ validate_common() {
   is_positive_integer "$ROUNDS" && (( ROUNDS <= 5 )) || fail '--rounds 必须是 1 到 5 的整数。'
   is_positive_integer "$POLICER_ROUNDS" && (( POLICER_ROUNDS >= 2 && POLICER_ROUNDS <= 5 )) || fail '--policer-rounds 必须是 2 到 5 的整数。'
   is_positive_integer "$PEER_MAX_RTT" && (( PEER_MAX_RTT <= 1000 )) || fail '--peer-max-rtt 必须是 1 到 1000 的整数。'
+  is_positive_integer "$MAX_TEST_GIB" && (( MAX_TEST_GIB <= 10000 )) || fail '--max-test-gib 必须是 1 到 10000 的整数。'
   [[ -z $BANDWIDTH_MBIT ]] || { is_positive_integer "$BANDWIDTH_MBIT" && (( BANDWIDTH_MBIT <= 100000 )) || fail '--bandwidth 必须是 1 到 100000 的整数。'; }
   [[ -z $RTT_MS ]] || { is_positive_integer "$RTT_MS" && (( RTT_MS <= 3000 )) || fail '--rtt 必须是 1 到 3000 的整数。'; }
 }
@@ -184,6 +192,18 @@ validate_peer() { [[ -n $PEER ]] || fail '未取得可用 iperf3 对端。'; [[ 
 
 auto_pick_peer() {
   local candidate location provider rtt ranked host port probe
+  if (( ! ALLOW_PUBLIC_PEERS )); then
+    warn '自动选择会向内置的 Leaseweb、OVH、Clouvider 等第三方节点发送 ping、TCP 探测和短时 iperf3 流量；对端会看到本机公网 IP。'
+    if [[ -t 0 && -t 1 ]]; then
+      local answer
+      yellow '[确认] 允许本次使用第三方公共测速节点吗？ [y/N] '
+      read -r answer
+      [[ $answer == y || $answer == Y || $answer == yes || $answer == YES ]] || fail '未获公共节点授权，已停止；可改用 --peer 指定自有/可信对端。'
+      ALLOW_PUBLIC_PEERS=1
+    else
+      fail '非交互自动选点必须显式加入 --allow-public-peers；更推荐用 --peer 指定自有/可信对端。'
+    fi
+  fi
   say '未指定 --peer，正在从内置公共 iperf3 节点中自动选择可用且 RTT 较低的对端。'
   command -v ping >/dev/null 2>&1 || warn '未安装 ping，将按节点顺序测试；建议安装 iputils-ping 以获得更准确的自动选择。'
   ranked=''
@@ -233,6 +253,20 @@ ensure_iperf3() {
 rate_to_mbit() {
   awk -v n="$1" -v u="$2" 'BEGIN {if(u~/^K/)n=n/1000; else if(u~/^G/)n=n*1000; else if(u~/^T/)n=n*1000000; printf "%.0f",n}'
 }
+guard_test_traffic() {
+  local label=$1 rate=$2 tests=$3 estimated_gib
+  is_positive_integer "$rate" || return 0
+  estimated_gib=$(awk -v r="$rate" -v d="$DURATION" -v n="$tests" 'BEGIN {g=r*d*n*1000000/8/1073741824; printf "%d", (g==int(g)?g:int(g)+1)}')
+  say "$label：按 ${rate}Mbit/s、${tests} 次、每次 ${DURATION}s 估算，最多约 ${estimated_gib} GiB。"
+  (( estimated_gib <= MAX_TEST_GIB )) && return 0
+  if (( ALLOW_HIGH_TRAFFIC )); then
+    warn "估算流量超过 ${MAX_TEST_GIB} GiB，但已由 --allow-high-traffic 明确授权。"
+    return 0
+  fi
+  MEASURE_FAILURE="$label 估算约 ${estimated_gib} GiB，超过上限 ${MAX_TEST_GIB} GiB"
+  warn "$MEASURE_FAILURE；未发送该阶段测速流量。需要继续时显式加入 --allow-high-traffic。"
+  return 1
+}
 MEASURE_RATE=''; MEASURE_RETRANS=''; MEASURE_RTT=''; MEASURE_FAILURE=''
 
 measure_rtt() {
@@ -278,6 +312,7 @@ measure() {
   [[ -n $PEER ]] || auto_pick_peer
   validate_peer
   local temporary_file round valid required rate retrans median_position estimated_mb
+  guard_test_traffic '本轮测速' "$BANDWIDTH_MBIT" "$ROUNDS" || return 1
   temporary_file=$(mktemp)
   chmod 600 "$temporary_file"
   valid=0
@@ -417,17 +452,37 @@ snapshot_transaction() {
   mv -f "$tmp" "$TRANSACTION_FILE"
 }
 restore_transaction_values() {
-  local key value
+  local key value failed=0
   [[ -f $TRANSACTION_FILE ]] || return 0
   while IFS=$'\t' read -r key value; do
-    [[ -z $key ]] || { sysctl_exists "$key" && sysctl -q -w "$key=$value" || warn "恢复本次修改前的 $key 失败。"; }
+    [[ -z $key ]] && continue
+    if ! sysctl_exists "$key" || ! sysctl -q -w "$key=$value"; then
+      warn "恢复本次修改前的 $key 失败。"
+      failed=1
+    fi
   done <"$TRANSACTION_FILE"
+  return "$failed"
 }
 discard_transaction() { rm -f "$TRANSACTION_FILE"; }
+abort_transaction() {
+  cleanup_candidate_bbr
+  if restore_transaction_values; then
+    discard_transaction
+    return 0
+  fi
+  warn "部分参数恢复失败；事务快照已保留：$TRANSACTION_FILE"
+  return 1
+}
 write_facts() {
   install -d -m 700 "$STATE_DIR"
-  { printf 'role\t%s\n' "$ROLE"; printf 'bandwidth_mbit\t%s\n' "$BANDWIDTH_MBIT"; printf 'target_rtt_ms\t%s\n' "$RTT_MS"; printf 'test_peer_rtt_ms\t%s\n' "${MEASURE_RTT:-}"; printf 'buffer_bdp_multiplier\t%s\n' "${BUFFER_MULTIPLIER_OVERRIDE:-default}"; printf 'tcp_initial_rmem\t%s\n' "$(calculate_initial_rmem "$(calculate_buffer)")"; printf 'tcp_initial_wmem\t%s\n' "$(calculate_initial_wmem "$(calculate_buffer)")"; printf 'peer\t%s\n' "$PEER"; printf 'measured_mbit\t%s\n' "${MEASURE_RATE:-}"; printf 'measured_retrans\t%s\n' "${MEASURE_RETRANS:-}"; } >"$FACTS_FILE"
-  chmod 600 "$FACTS_FILE"
+  local tmp
+  tmp=$(mktemp "$STATE_DIR/facts.XXXXXX") || return 1
+  chmod 600 "$tmp" || { rm -f "$tmp"; return 1; }
+  if ! { printf 'role\t%s\n' "$ROLE"; printf 'bandwidth_mbit\t%s\n' "$BANDWIDTH_MBIT"; printf 'target_rtt_ms\t%s\n' "$RTT_MS"; printf 'test_peer_rtt_ms\t%s\n' "${MEASURE_RTT:-}"; printf 'buffer_bdp_multiplier\t%s\n' "${BUFFER_MULTIPLIER_OVERRIDE:-default}"; printf 'tcp_initial_rmem\t%s\n' "$(calculate_initial_rmem "$(calculate_buffer)")"; printf 'tcp_initial_wmem\t%s\n' "$(calculate_initial_wmem "$(calculate_buffer)")"; printf 'peer\t%s\n' "$PEER"; printf 'measured_mbit\t%s\n' "${MEASURE_RATE:-}"; printf 'measured_retrans\t%s\n' "${MEASURE_RETRANS:-}"; printf 'facts_end\t1\n'; } >"$tmp"; then
+    rm -f "$tmp"; return 1
+  fi
+  tail -n 1 "$tmp" | grep -Fqx $'facts_end\t1' || { rm -f "$tmp"; return 1; }
+  mv -f "$tmp" "$FACTS_FILE"
 }
 write_experiment_report() {
   local baseline_rate=$1 baseline_retrans=$2 after_rate=$3 after_retrans=$4 decision=$5 report_file
@@ -464,17 +519,31 @@ is_material_regression() {
 }
 revert_auto_experiment() {
   warn '复测失败或出现明显退化，正在恢复本次应用前的 TCP 参数。'
-  restore_transaction_values; cleanup_candidate_bbr; discard_transaction
-  ok '已恢复本次实验前的参数；实验报告仍保留。'
+  if abort_transaction; then
+    ok '已恢复本次实验前的参数；实验报告仍保留。'
+    return 0
+  fi
+  return 1
 }
 write_config() {
-  local tmp i; tmp=$(mktemp "${CONFIG_FILE}.XXXXXX"); chmod 644 "$tmp"
-  { printf '%s\n' "$MARKER"; printf '# role=%s bandwidth=%sMbit rtt=%sms generated=%s\n' "$ROLE" "$BANDWIDTH_MBIT" "$RTT_MS" "$(date -u '+%Y-%m-%dT%H:%M:%SZ')"; for i in "${!KEYS[@]}"; do printf '%s = %s\n' "${KEYS[$i]}" "${VALUES[$i]}"; done; } >"$tmp"
+  local tmp i; tmp=$(mktemp "${CONFIG_FILE}.XXXXXX") || return 1
+  chmod 644 "$tmp" || { rm -f "$tmp"; return 1; }
+  if ! { printf '%s\n' "$MARKER"; printf '# role=%s bandwidth=%sMbit rtt=%sms generated=%s\n' "$ROLE" "$BANDWIDTH_MBIT" "$RTT_MS" "$(date -u '+%Y-%m-%dT%H:%M:%SZ')"; for i in "${!KEYS[@]}"; do printf '%s = %s\n' "${KEYS[$i]}" "${VALUES[$i]}"; done; printf '# vps-tcp-safe-tuner-end\n'; } >"$tmp"; then
+    rm -f "$tmp"; return 1
+  fi
+  tail -n 1 "$tmp" | grep -Fqx '# vps-tcp-safe-tuner-end' || { rm -f "$tmp"; return 1; }
   mv -f "$tmp" "$CONFIG_FILE"
 }
 restore_snapshot_values() {
-  local key value; [[ -f $SNAPSHOT_FILE ]] || return 0
-  while IFS=$'\t' read -r key value; do [[ -z $key ]] || { sysctl_exists "$key" && sysctl -q -w "$key=$value" || warn "恢复 $key 失败。"; }; done <"$SNAPSHOT_FILE"
+  local key value failed=0; [[ -f $SNAPSHOT_FILE ]] || return 0
+  while IFS=$'\t' read -r key value; do
+    [[ -z $key ]] && continue
+    if ! sysctl_exists "$key" || ! sysctl -q -w "$key=$value"; then
+      warn "恢复 $key 失败。"
+      failed=1
+    fi
+  done <"$SNAPSHOT_FILE"
+  return "$failed"
 }
 restore_legacy_core_defaults() {
   # v3.6.0 曾误把 TCP 初始值同时写入全局 socket 默认值。TCP 实际由
@@ -504,23 +573,29 @@ apply_tuning() {
   snapshot_transaction
   if ! restore_legacy_core_defaults; then
     warn '旧版全局 socket 默认值恢复失败，正在恢复本次应用前参数。'
-    restore_transaction_values; discard_transaction; cleanup_candidate_bbr
+    abort_transaction || fail '调优失败，且部分参数未能恢复；事务快照已保留。'
     fail '调优失败，已恢复本次应用前参数。'
   fi
   if ! apply_built_settings; then
     warn '候选 sysctl 应用失败，正在恢复本次应用前参数。'
-    restore_transaction_values; discard_transaction; cleanup_candidate_bbr
+    abort_transaction || fail '调优失败，且部分参数未能恢复；事务快照已保留。'
     fail '调优失败，已恢复本次应用前参数。'
   fi
   if (( DEFER_PERSIST )); then
     TUNING_APPLIED=1; ok "已临时应用 ${#KEYS[@]} 项候选 TCP 设置，复测通过后才会持久化。"
   else
-    write_config; write_facts; discard_transaction; TUNING_APPLIED=1; ok "已应用 ${#KEYS[@]} 项自适应 TCP 设置。"
+    if ! write_facts || ! write_config; then
+      warn '持久化文件写入失败，正在恢复本次应用前参数。'
+      abort_transaction || fail '持久化失败，且部分参数未能恢复；事务快照已保留。'
+      fail '持久化失败，已恢复本次应用前参数。'
+    fi
+    discard_transaction; TUNING_APPLIED=1; ok "已应用 ${#KEYS[@]} 项自适应 TCP 设置。"
   fi
 }
 search_buffer_candidates() {
   local saved_override=$BUFFER_MULTIPLIER_OVERRIDE saved_rounds=$ROUNDS candidate candidate_rate candidate_retrans best_multiplier='' best_rate=0 best_retrans=0
   local -a candidates=(1 2 3)
+  guard_test_traffic 'BDP 缓冲区搜索' "$BANDWIDTH_MBIT" 6 || { warn '已跳过高流量缓冲区搜索，保留默认 2× BDP 候选。'; return 0; }
   say '开始 BDP 缓冲区 A/B 搜索：分别测试 1×、2×、3× BDP 上限。'
   say '每个候选使用两轮测试；仅保留吞吐最高且重传不明显恶化的候选。'
   ROUNDS=2
@@ -545,13 +620,13 @@ search_buffer_candidates() {
   if [[ -z $best_multiplier ]]; then
     BUFFER_MULTIPLIER_OVERRIDE=$saved_override
     build_settings
-    apply_built_settings || { restore_transaction_values; fail '所有缓冲区候选均失败，已恢复本次应用前参数。'; }
+    apply_built_settings || { abort_transaction || fail '所有缓冲区候选均失败，且部分参数未能恢复；事务快照已保留。'; fail '所有缓冲区候选均失败，已恢复本次应用前参数。'; }
     warn '没有重传可接受的缓冲区候选，已恢复搜索前配置。'
     return 0
   fi
   BUFFER_MULTIPLIER_OVERRIDE=$best_multiplier
   build_settings
-  apply_built_settings || { restore_transaction_values; fail '最佳缓冲区候选应用失败，已恢复本次应用前参数。'; }
+  apply_built_settings || { abort_transaction || fail '最佳缓冲区候选应用失败，且部分参数未能恢复；事务快照已保留。'; fail '最佳缓冲区候选应用失败，已恢复本次应用前参数。'; }
   say "已选择 ${best_multiplier}× BDP 缓冲区：${best_rate}Mbit，累计重传 ${best_retrans}。"
 }
 
@@ -619,18 +694,43 @@ restore_root_qdisc() {
 remove_qdisc_snapshot() {
   [[ ${1:-} == "$STATE_DIR"/qdisc-before-shape.* || ${1:-} == "$STATE_DIR"/qdisc-scan.* ]] && rm -f -- "$1"
 }
+managed_file_or_absent() {
+  local path=$1 marker=$2
+  if [[ -e $path || -L $path ]]; then
+    [[ -f $path && ! -L $path ]] || fail "拒绝覆盖非普通文件：$path"
+    grep -Fqx "$marker" "$path" || fail "拒绝覆盖不归本工具管理的文件：$path"
+  fi
+}
+remove_managed_file() {
+  local path=$1 marker=$2
+  [[ -e $path || -L $path ]] || return 0
+  [[ -f $path && ! -L $path ]] || fail "拒绝删除非普通文件：$path"
+  grep -Fqx "$marker" "$path" || fail "拒绝删除不归本工具管理的文件：$path"
+  rm -f -- "$path"
+}
 write_shape_service() {
-  local iface=$1 rate=$2 original=$3 original_spec=$4
-  install -d -m 700 "$STATE_DIR"; printf '%s\t%s\t%s\t%s\n' "$iface" "$rate" "$original" "$original_spec" >"$SHAPE_STATE"; chmod 600 "$SHAPE_STATE"
-  cat >"$SHAPE_SCRIPT" <<EOF
+  local iface=$1 rate=$2 original=$3 original_spec=$4 script_tmp unit_tmp state_tmp
+  validate_iface "$iface"
+  is_positive_integer "$rate" && (( rate <= 100000 )) || fail '拒绝写入无效整形速率。'
+  managed_file_or_absent "$SHAPE_SCRIPT" "$SHAPE_SCRIPT_MARKER"
+  managed_file_or_absent "$SHAPE_UNIT" "$SHAPE_UNIT_MARKER"
+  install -d -m 700 "$STATE_DIR" || return 1
+  script_tmp=$(mktemp "${SHAPE_SCRIPT}.XXXXXX") || return 1
+  unit_tmp=$(mktemp "${SHAPE_UNIT}.XXXXXX") || { rm -f "$script_tmp"; return 1; }
+  state_tmp=$(mktemp "$STATE_DIR/qdisc.XXXXXX") || { rm -f "$script_tmp" "$unit_tmp"; return 1; }
+  if ! cat >"$script_tmp" <<EOF
 #!/usr/bin/env bash
+$SHAPE_SCRIPT_MARKER
 set -Eeuo pipefail
 tc qdisc replace dev '$iface' root handle 1: htb default 10
 tc class replace dev '$iface' parent 1: classid 1:10 htb rate ${rate}mbit ceil ${rate}mbit
 tc qdisc replace dev '$iface' parent 1:10 handle 10: fq
 EOF
-  chmod 700 "$SHAPE_SCRIPT"
-  cat >"$SHAPE_UNIT" <<EOF
+  then
+    rm -f "$script_tmp" "$unit_tmp" "$state_tmp"; return 1
+  fi
+  if ! cat >"$unit_tmp" <<EOF
+$SHAPE_UNIT_MARKER
 [Unit]
 Description=VPS TCP Safe Tuner egress shaper
 After=network-online.target
@@ -639,23 +739,47 @@ Wants=network-online.target
 Type=oneshot
 ExecStart=$SHAPE_SCRIPT
 RemainAfterExit=yes
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+RestrictSUIDSGID=yes
+CapabilityBoundingSet=CAP_NET_ADMIN
+AmbientCapabilities=CAP_NET_ADMIN
+UMask=0077
 [Install]
 WantedBy=multi-user.target
 EOF
-  chmod 644 "$SHAPE_UNIT"; systemctl daemon-reload; systemctl enable vps-tcp-safe-tuner-qdisc.service >/dev/null
+  then
+    rm -f "$script_tmp" "$unit_tmp" "$state_tmp"; return 1
+  fi
+  if ! printf '%s\t%s\t%s\t%s\n' "$iface" "$rate" "$original" "$original_spec" >"$state_tmp" ||
+     ! chmod 700 "$script_tmp" || ! chmod 644 "$unit_tmp" || ! chmod 600 "$state_tmp" ||
+     ! mv -f "$script_tmp" "$SHAPE_SCRIPT" || ! mv -f "$unit_tmp" "$SHAPE_UNIT" ||
+     ! mv -f "$state_tmp" "$SHAPE_STATE"; then
+    rm -f "$script_tmp" "$unit_tmp" "$state_tmp"; return 1
+  fi
+  systemctl daemon-reload && systemctl enable vps-tcp-safe-tuner-qdisc.service >/dev/null
 }
-apply_shape() { tc qdisc replace dev "$1" root handle 1: htb default 10; tc class replace dev "$1" parent 1: classid 1:10 htb rate "${2}mbit" ceil "${2}mbit"; tc qdisc replace dev "$1" parent 1:10 handle 10: fq; }
+apply_shape() { validate_iface "$1"; tc qdisc replace dev "$1" root handle 1: htb default 10; tc class replace dev "$1" parent 1: classid 1:10 htb rate "${2}mbit" ceil "${2}mbit"; tc qdisc replace dev "$1" parent 1:10 handle 10: fq; }
 shape() {
   require_root; require_linux; require_command tc; require_command systemctl; lock; validate_common; is_positive_integer "$SHAPE_RATE" || fail 'shape 需要 --shape-rate 正整数。'; (( SHAPE_RATE <= 100000 )) || fail '--shape-rate 不能超过 100000 Mbit/s。'
   local iface original original_spec snapshot qdisc_backup
   (( ENABLE_SHAPING )) || fail '整形必须显式加入 --enable-shaping。'
   iface=$(default_interface); [[ -n $iface ]] || fail '未检测到默认出口网卡。'
+  validate_iface "$iface"
+  [[ ! -e $SHAPE_STATE ]] || fail '已存在本工具整形状态；请先执行 unshape，避免覆盖原始 qdisc 快照。'
   install -d -m 700 "$STATE_DIR"; qdisc_backup=$(mktemp "$STATE_DIR/qdisc-before-shape.XXXXXX")
   snapshot=$(qdisc_snapshot "$iface" "$qdisc_backup") || { rm -f -- "$qdisc_backup"; fail '当前根 qdisc 无法精确重建；为避免破坏多队列或特殊配置，拒绝整形。'; }
   IFS=$'\t' read -r original original_spec <<<"$snapshot"
   [[ $original == mq ]] || rm -f -- "$qdisc_backup"
   line; warn "整形将暂时替换 $iface 的活动根 qdisc=$original，可能短暂影响连接。"; [[ $original == mq ]] && say '已保存 mq 的每个可恢复叶子 qdisc 参数。' || say "已保存根队列参数：${original_spec:-默认参数}"; say "目标速率：${SHAPE_RATE} Mbit/s；叶子队列：FQ；重启后由 systemd 恢复。"
-  (( DRY_RUN )) && { remove_qdisc_snapshot "$qdisc_backup"; ok '整形预览完成，未修改系统。'; return 0; }; confirm '确认应用 HTB + FQ 出向整形吗？' || { remove_qdisc_snapshot "$qdisc_backup"; say '已取消。'; return 0; }; write_shape_service "$iface" "$SHAPE_RATE" "$original" "$original_spec"
+  (( DRY_RUN )) && { remove_qdisc_snapshot "$qdisc_backup"; ok '整形预览完成，未修改系统。'; return 0; }; confirm '确认应用 HTB + FQ 出向整形吗？' || { remove_qdisc_snapshot "$qdisc_backup"; say '已取消。'; return 0; }
+  if ! write_shape_service "$iface" "$SHAPE_RATE" "$original" "$original_spec"; then
+    warn '持久化整形服务写入或启用失败，正在清理并恢复原 qdisc。'
+    ASSUME_YES=1; unshape || true
+    fail '整形持久化失败，未保留候选整形。'
+  fi
   if ! apply_shape "$iface" "$SHAPE_RATE"; then
     warn '应用整形失败，正在移除本工具创建的持久化整形文件。'
     ASSUME_YES=1; unshape || true
@@ -666,8 +790,14 @@ shape() {
 unshape() {
   require_root; require_linux; require_command tc; require_command systemctl; lock; [[ -f $SHAPE_STATE ]] || { say '未检测到本工具创建的整形。'; return 0; }
   local iface rate original original_spec; IFS=$'\t' read -r iface rate original original_spec <"$SHAPE_STATE"; qdisc_is_restorable "$original" || fail '整形状态损坏，拒绝猜测原始 qdisc。'
+  validate_iface "$iface"; is_positive_integer "$rate" && (( rate <= 100000 )) || fail '整形状态中的速率无效，拒绝继续。'
+  managed_file_or_absent "$SHAPE_SCRIPT" "$SHAPE_SCRIPT_MARKER"
+  managed_file_or_absent "$SHAPE_UNIT" "$SHAPE_UNIT_MARKER"
   (( DRY_RUN )) && { say "将恢复 $iface 的根 qdisc 为 $original。"; return 0; }; confirm "移除 ${rate}Mbit 整形并恢复 $original 吗？" || { say '已取消。'; return 0; }
-  systemctl disable --now vps-tcp-safe-tuner-qdisc.service >/dev/null 2>&1 || true; rm -f "$SHAPE_UNIT" "$SHAPE_SCRIPT"; systemctl daemon-reload
+  systemctl disable --now vps-tcp-safe-tuner-qdisc.service >/dev/null 2>&1 || true
+  remove_managed_file "$SHAPE_UNIT" "$SHAPE_UNIT_MARKER"
+  remove_managed_file "$SHAPE_SCRIPT" "$SHAPE_SCRIPT_MARKER"
+  systemctl daemon-reload
   restore_root_qdisc "$iface" "$original" "$original_spec" || fail '恢复根 qdisc 参数失败；整形状态文件已保留，可检查后重试。'
   remove_qdisc_snapshot "$original_spec"; rm -f "$SHAPE_STATE"; ok '已移除本工具整形并恢复根 qdisc 参数。'
 }
@@ -692,11 +822,13 @@ scan_shaper_candidate() {
   local nominal candidate best='' last_clean='' broke_at='' iface original original_spec snapshot saved_rounds baseline_retrans qdisc_backup probe_status safe_rate
   local -a coarse=(85 92 99 106 114 123 133 145)
   iface=$(default_interface); [[ -n $iface ]] || fail '未检测到默认出口网卡。'
+  validate_iface "$iface"
   install -d -m 700 "$STATE_DIR"; qdisc_backup=$(mktemp "$STATE_DIR/qdisc-scan.XXXXXX")
   snapshot=$(qdisc_snapshot "$iface" "$qdisc_backup") || { rm -f -- "$qdisc_backup"; fail '当前根 qdisc 无法精确重建，拒绝扫描整形。'; }
   IFS=$'\t' read -r original original_spec <<<"$snapshot"
   [[ $original == mq ]] || rm -f -- "$qdisc_backup"
   nominal=$BANDWIDTH_MBIT
+  guard_test_traffic '限速器拐点扫描（最坏情况）' "$nominal" "$(( POLICER_ROUNDS * 16 ))" || { warn '已跳过高流量限速器扫描；基础 TCP 调优不受影响。'; remove_qdisc_snapshot "$qdisc_backup"; return 0; }
   baseline_retrans=${MEASURE_RETRANS:-0}
   say "开始限速器拐点扫描：以 ${nominal}Mbit 基线从 85% 到 145% 自适应粗扫。"
   say "每个候选使用 ${POLICER_ROUNDS} 轮测试；判定会同时参考基线重传噪声和送达率。"
@@ -789,7 +921,12 @@ auto() {
     revert_auto_experiment
     return 0
   fi
-  write_config; write_facts; discard_transaction
+  if ! write_facts || ! write_config; then
+    warn '复测通过，但持久化文件写入失败，正在恢复实验前参数。'
+    abort_transaction || fail '持久化失败，且部分参数未能恢复；事务快照已保留。'
+    fail '持久化失败，已恢复实验前参数。'
+  fi
+  discard_transaction
   ok '复测未出现明显退化，已保留候选 TCP 配置。'
   if (( ENABLE_SHAPING )); then
     if [[ $MEASURE_RETRANS == 0 ]]; then say '验证无重传，跳过限速器扫描。';
@@ -813,7 +950,9 @@ status() {
 rollback() {
   require_root; require_linux; require_command sysctl; lock; [[ -f $SNAPSHOT_FILE ]] || fail '未找到首次快照；拒绝猜测系统原始值。'
   (( DRY_RUN )) && { say '将恢复 sysctl 快照并移除本工具配置和整形。'; return 0; }; confirm '恢复首次 sysctl 快照并移除本工具的持久化配置/整形吗？' || { say '已取消。'; return 0; }
-  [[ -f $SHAPE_STATE ]] && { ASSUME_YES=1; unshape; }; restore_snapshot_values; remove_bbr_module_config; rm -f "$CONFIG_FILE" "$SNAPSHOT_FILE" "$FACTS_FILE" "$TRANSACTION_FILE"; rmdir "$STATE_DIR" 2>/dev/null || true; ok '已恢复快照并清理本工具创建的持久化文件。'
+  [[ -f $SHAPE_STATE ]] && { ASSUME_YES=1; unshape; }
+  restore_snapshot_values || fail "部分 sysctl 恢复失败；配置和快照均已保留，请检查后重试：$SNAPSHOT_FILE"
+  remove_bbr_module_config; rm -f "$CONFIG_FILE" "$SNAPSHOT_FILE" "$FACTS_FILE" "$TRANSACTION_FILE"; rmdir "$STATE_DIR" 2>/dev/null || true; ok '已恢复快照并清理本工具创建的持久化文件。'
 }
 menu() {
   require_linux; line; say "VPS TCP 自适应调优器 v$VERSION"; line
@@ -836,8 +975,8 @@ EOF
 }
 parse_options() {
   while (($#)); do case "$1" in
-    --peer) PEER=${2:-}; shift 2 ;; --port) PEER_PORT=${2:-}; shift 2 ;; --role) ROLE=${2:-}; shift 2 ;; --bandwidth) BANDWIDTH_MBIT=${2:-}; shift 2 ;; --rtt) RTT_MS=${2:-}; shift 2 ;; --duration) DURATION=${2:-}; shift 2 ;; --workers) WORKERS=${2:-}; shift 2 ;; --rounds) ROUNDS=${2:-}; shift 2 ;; --policer-rounds) POLICER_ROUNDS=${2:-}; shift 2 ;; --shape-rate) SHAPE_RATE=${2:-}; shift 2 ;;
-    --enable-shaping) ENABLE_SHAPING=1; shift ;; --search-buffers) BUFFER_SEARCH=1; shift ;; --dry-run) DRY_RUN=1; shift ;; --yes) ASSUME_YES=1; shift ;; --no-install) NO_INSTALL=1; shift ;; --keep-on-regression) KEEP_ON_REGRESSION=1; shift ;; -h|--help) usage; exit 0 ;; *) fail "未知选项：$1" ;;
+    --peer) PEER=${2:-}; shift 2 ;; --port) PEER_PORT=${2:-}; shift 2 ;; --role) ROLE=${2:-}; shift 2 ;; --bandwidth) BANDWIDTH_MBIT=${2:-}; shift 2 ;; --rtt) RTT_MS=${2:-}; shift 2 ;; --duration) DURATION=${2:-}; shift 2 ;; --workers) WORKERS=${2:-}; shift 2 ;; --rounds) ROUNDS=${2:-}; shift 2 ;; --policer-rounds) POLICER_ROUNDS=${2:-}; shift 2 ;; --peer-max-rtt) PEER_MAX_RTT=${2:-}; shift 2 ;; --max-test-gib) MAX_TEST_GIB=${2:-}; shift 2 ;; --shape-rate) SHAPE_RATE=${2:-}; shift 2 ;;
+    --enable-shaping) ENABLE_SHAPING=1; shift ;; --search-buffers) BUFFER_SEARCH=1; shift ;; --allow-public-peers) ALLOW_PUBLIC_PEERS=1; shift ;; --allow-high-traffic) ALLOW_HIGH_TRAFFIC=1; shift ;; --dry-run) DRY_RUN=1; shift ;; --yes) ASSUME_YES=1; shift ;; --no-install) NO_INSTALL=1; shift ;; --keep-on-regression) KEEP_ON_REGRESSION=1; shift ;; -h|--help) usage; exit 0 ;; *) fail "未知选项：$1" ;;
   esac; done
 }
 main() {
