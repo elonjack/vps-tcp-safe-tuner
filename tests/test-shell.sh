@@ -15,6 +15,7 @@ assert_equals 1250 "$(rate_to_mbit 1.25 Gbits/sec)" 'Gbit 转 Mbit'
 assert_equals 1 "$(rate_to_mbit 1000 Kbits/sec)" 'Kbit 转 Mbit'
 assert_equals 1126 "$(transfer_to_mib 1.10 GBytes)" 'GBytes 转 MiB'
 assert_equals 1024 "$(retrans_per_gib 1000 1000)" '按传输量归一化重传'
+assert_equals 'limit 2048 flows 512 flow_limit 100 target 5.0ms interval 100.0ms' "$(normalize_qdisc_spec 'limit 2048p flows 512 flow_limit 100p target 5.0ms interval 100.0ms')" 'tc 显示参数规范化'
 
 is_safe_iface eth0 || { printf '常规网卡名校验失败。\n' >&2; exit 1; }
 is_safe_iface 'ens3.100' || { printf 'VLAN 网卡名校验失败。\n' >&2; exit 1; }

@@ -19,6 +19,8 @@ jobs:
           bash -n tests/test-shell.sh
       - name: Shell 功能测试
         run: bash tests/test-shell.sh
+      - name: 真实 qdisc 保存与恢复测试
+        run: sudo bash tests/test-qdisc-linux.sh
       - name: ShellCheck
         uses: ludeeus/action-shellcheck@2.0.0
         with:

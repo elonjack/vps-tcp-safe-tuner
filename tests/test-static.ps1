@@ -27,6 +27,8 @@ if ($content -notmatch 'MAX_RATE_SPREAD_PERCENT') { throw 'Missing multi-round s
 if ($content -notmatch 'command\+=\(-R\)') { throw 'Missing iperf3 reverse-direction measurement.' }
 if ($content -notmatch 'qdisc_candidate_is_better') { throw 'Missing measured FQ candidate selection.' }
 if ($content -notmatch 'restore_managed_qdisc_tune') { throw 'Missing managed active-qdisc rollback.' }
+if ($content -notmatch 'normalize_qdisc_spec') { throw 'Missing tc display-to-input qdisc normalization.' }
+if ($content -notmatch 'abort_after_qdisc_restore_failure') { throw 'Missing sysctl fallback after qdisc restore failure.' }
 if ($content -notmatch 'MEASURE_STAGE_TRANSFER_MIB') { throw 'Missing runtime traffic-volume guard.' }
 if ($content -notmatch 'transaction\.tsv') { throw 'Missing per-run transaction snapshot.' }
 if ($content -notmatch 'restore_transaction_values') { throw 'Missing per-run transaction restore.' }
@@ -39,7 +41,7 @@ if ($content -notmatch 'SHAPE_SCRIPT_MARKER') { throw 'Persistent shaping script
 if ($content -notmatch 'SHAPE_UNIT_MARKER') { throw 'Persistent shaping unit needs an ownership marker.' }
 if ($content -notmatch 'validate_iface') { throw 'Interface names must be validated before persistence.' }
 if ($content -notmatch '部分 sysctl 恢复失败；配置和快照均已保留') { throw 'Rollback must retain evidence after partial restore failure.' }
-if ($installContent -notmatch "readonly VERSION='5\.0\.0'") { throw 'Installer version is stale.' }
+if ($installContent -notmatch "readonly VERSION='5\.0\.1'") { throw 'Installer version is stale.' }
 if ($installContent -match "EXPECTED_SHA256='TO_BE_REPLACED'") { throw 'Installer checksum placeholder was not replaced.' }
 if ($installContent -notmatch '--local') { throw 'Installer needs an offline/local verified path.' }
 $expectedMatch = [regex]::Match($installContent, "EXPECTED_SHA256='([0-9a-f]{64})'")

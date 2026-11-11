@@ -6,7 +6,7 @@ set -Eeuo pipefail
 IFS=$'\n\t'
 umask 077
 
-readonly VERSION='5.0.0'
+readonly VERSION='5.0.1'
 readonly STATE_DIR='/var/lib/vps-tcp-safe-tuner'
 readonly SNAPSHOT_FILE="$STATE_DIR/baseline.tsv"
 readonly TRANSACTION_FILE="$STATE_DIR/transaction.tsv"
@@ -804,6 +804,17 @@ qdisc_snapshot() {
   spec=$(sed -E 's/^qdisc [^ ]+ [^ ]+ root( refcnt [0-9]+)?[ ]*//' <<<"$line")
   printf '%s\t%s' "$kind" "$spec"
 }
+normalize_qdisc_spec() {
+  awk '{
+    previous = ""
+    for (i = 1; i <= NF; i += 1) {
+      token = $i
+      if ((previous == "limit" || previous == "flow_limit") && token ~ /^[0-9]+p$/) sub(/p$/, "", token)
+      printf "%s%s", (i == 1 ? "" : " "), token
+      previous = $i
+    }
+  }' <<<"$1"
+}
 restore_mq_root_qdisc() {
   local iface=$1 snapshot_file=$2 kind parent spec minor
   local -a arguments=()
@@ -815,6 +826,7 @@ restore_mq_root_qdisc() {
     minor=${parent##*:}
     arguments=()
     if [[ -n $spec ]]; then
+      spec=$(normalize_qdisc_spec "$spec")
       local IFS=' '
       read -r -a arguments <<<"$spec"
     fi
@@ -827,6 +839,7 @@ restore_root_qdisc() {
   qdisc_is_restorable "$kind" || return 1
   [[ $kind != mq ]] || { restore_mq_root_qdisc "$iface" "$spec"; return; }
   if [[ -n $spec ]]; then
+    spec=$(normalize_qdisc_spec "$spec")
     local IFS=' '
     read -r -a arguments <<<"$spec"
   fi
@@ -879,6 +892,13 @@ qdisc_candidate_is_better() {
 }
 clear_qdisc_experiment_globals() {
   QDISC_SELECTED_FQ=0; QDISC_CHANGED=0; QDISC_ORIGINAL_IFACE=''; QDISC_ORIGINAL_KIND=''; QDISC_ORIGINAL_SPEC=''; QDISC_BACKUP_FILE=''
+}
+abort_after_qdisc_restore_failure() {
+  local message=$1
+  warn '活动 qdisc 恢复失败，正在至少恢复本次实验前的 sysctl。'
+  if abort_transaction; then warn 'sysctl 已恢复；活动 qdisc 仍需人工处理。'
+  else warn "部分 sysctl 也未能恢复；事务快照仍保留：$TRANSACTION_FILE"; fi
+  fail "$message。队列快照仍保留；可先执行：tc qdisc replace dev $QDISC_ORIGINAL_IFACE root $QDISC_ORIGINAL_KIND"
 }
 restore_qdisc_experiment() {
   (( QDISC_CHANGED )) || return 0
@@ -946,14 +966,14 @@ search_qdisc_candidate() {
   base_reverse_rate=${MEASURE_REVERSE_RATE:-0}; base_reverse_retrans=${MEASURE_REVERSE_RETRANS_PER_GIB:-0}
   if ! apply_fq_candidate "$iface" "$QDISC_ORIGINAL_KIND" "$QDISC_ORIGINAL_SPEC"; then
     ROUNDS=$saved_rounds
-    restore_root_qdisc "$iface" "$QDISC_ORIGINAL_KIND" "$QDISC_ORIGINAL_SPEC" >/dev/null 2>&1 || fail 'FQ 候选应用失败，且原活动 qdisc 未能恢复，请立即检查网络。'
+    restore_root_qdisc "$iface" "$QDISC_ORIGINAL_KIND" "$QDISC_ORIGINAL_SPEC" >/dev/null 2>&1 || abort_after_qdisc_restore_failure 'FQ 候选应用失败，且原活动 qdisc 未能自动恢复'
     remove_qdisc_snapshot "$QDISC_BACKUP_FILE"; clear_qdisc_experiment_globals; drop_setting net.core.default_qdisc
     warn 'FQ 候选无法应用，已恢复原活动 qdisc。'; return 0
   fi
   QDISC_CHANGED=1
   if ! measure; then
     ROUNDS=$saved_rounds
-    restore_qdisc_experiment || fail 'FQ 候选测量失败，且原活动 qdisc 未能恢复，请立即检查网络。'
+    restore_qdisc_experiment || abort_after_qdisc_restore_failure 'FQ 候选测量失败，且原活动 qdisc 未能自动恢复'
     drop_setting net.core.default_qdisc; warn 'FQ 候选测量不稳定，已恢复原活动 qdisc。'; return 0
   fi
   candidate_rate=$MEASURE_RATE; candidate_retrans=$MEASURE_RETRANS_PER_GIB
@@ -962,14 +982,14 @@ search_qdisc_candidate() {
   say "队列对比：原队列出站/入站 ${base_rate}/${base_reverse_rate} Mbit；FQ ${candidate_rate}/${candidate_reverse_rate} Mbit。"
   if qdisc_candidate_is_better "$base_rate" "$base_retrans" "$base_reverse_rate" "$base_reverse_retrans" "$candidate_rate" "$candidate_retrans" "$candidate_reverse_rate" "$candidate_reverse_retrans"; then
     if ! set_setting_value net.core.default_qdisc fq || ! sysctl -q -w net.core.default_qdisc=fq; then
-      restore_qdisc_experiment || fail 'FQ 持久化失败，且原活动 qdisc 未能恢复，请立即检查网络。'
+      restore_qdisc_experiment || abort_after_qdisc_restore_failure 'FQ 持久化失败，且原活动 qdisc 未能自动恢复'
       drop_setting net.core.default_qdisc; warn 'FQ 无法写入持久配置，已恢复原活动 qdisc。'; return 0
     fi
     QDISC_SELECTED_FQ=1
     ok 'FQ 双向综合吞吐至少提升 5%，且单方向下降未超过 5%；已选择 FQ 候选。'
     return 0
   fi
-  restore_qdisc_experiment || fail 'FQ 未胜出，且原活动 qdisc 未能恢复，请立即检查网络。'
+  restore_qdisc_experiment || abort_after_qdisc_restore_failure 'FQ 未胜出，且原活动 qdisc 未能自动恢复'
   drop_setting net.core.default_qdisc
   say 'FQ 未达到双向择优门槛，已恢复原活动 qdisc。'
 }

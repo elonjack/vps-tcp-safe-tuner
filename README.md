@@ -11,7 +11,7 @@
 SSH 登录 VPS 后，复制下面两行执行：
 
 ```bash
-curl -fLO https://github.com/elonjack/vps-tcp-safe-tuner/releases/download/v5.0.0/install.sh
+curl -fLO https://github.com/elonjack/vps-tcp-safe-tuner/releases/download/v5.0.1/install.sh
 bash install.sh
 ```
 
