@@ -1,154 +1,209 @@
 # VPS TCP 自适应调优器
 
-面向 Linux VPS 的 TCP 调优与验证工具。它可通过可信 iperf3 对端测出实际吞吐、重传和 RTT，按 BDP、内存与用途推导缓冲区和队列参数，并提供可选 HTB + FQ 整形、验证和回滚。
+给 Linux VPS 使用的 TCP 调优脚本。它会先测速，再按机器情况调整 BBR、FQ 和 TCP 缓冲区；效果明显变差时会自动恢复。
 
-> 没有任何 TCP 脚本可以让所有 VPS 都变快。线路、套餐限速、对端性能和晚高峰拥塞才是决定因素。本项目坚持“先测量、再调整、再验证；无收益可回滚”。
+> 调优不能修复差线路、晚高峰拥堵或商家限速。建议先在非关键 VPS 上测试。
 
-## 能力
+## 小白直接照着做
 
-| 能力 | 说明 |
-| --- | --- |
-| 机器画像 | 内核、BBR、内存、虚拟化、默认网卡与活动 qdisc 检测 |
-| 多轮基准实验 | 同一对端多轮测试，使用中位吞吐减少偶发波动；记录重传、RTT 与估算流量 |
-| 自适应 BDP | 使用实测带宽和 RTT，按用途与内存限制推导 TCP 缓冲区 |
-| 缓冲区 A/B 搜索 | 可选比较 1×、2×、3× BDP 缓冲区，保留吞吐最高且重传可接受的候选 |
-| TCP 调优 | BBR、FQ 默认队列、收发缓冲区、MTU 探测、慢启动、backlog 与连接队列 |
-| 限速器处理 | 可选、明确确认的 HTB + FQ 整形；基线噪声感知的 85%–145% 粗扫、三轮复测、二分精扫与安全余量建议 |
-| 多队列恢复 | 保存常见单根 qdisc 参数；对常见 `mq` 多队列根同时保存每个可恢复叶子队列并逐个恢复 |
-| 性能保护 | 调优前后使用相同对端复测；吞吐明显退化或重传明显增加时默认自动回滚 |
-| 流量护栏 | 单阶段默认最多估算 20 GiB；超限必须显式使用 `--allow-high-traffic`，`--yes` 不能代替授权 |
-| 持久化与回滚 | 专属 sysctl/systemd 文件；首次变更前保存精确 sysctl 快照与实验报告；恢复不完整时保留快照 |
+### 第一步：安装
 
-## 安全设计
-
-- 主调优脚本不下载或执行远程代码，不包含运行统计、遥测、广告请求或作者控制的回传地址。
-- iperf3 缺失时才会询问是否安装系统包；绝不运行 `apt update`。
-- 不指定 `--peer` 时，使用第三方公共测速节点前必须交互确认；无人值守运行必须显式加入 `--allow-public-peers`。`--yes` 不会绕过这项外联授权。
-- 默认不触碰正在运行的根 qdisc；整形必须额外使用 `--enable-shaping` 并确认。
-- 对端、速率、轮次及写入持久化脚本的网卡名均有范围或字符校验。
-- 写入 `/usr/local/sbin` 和 `/etc/systemd/system` 前检查所有权标记，拒绝覆盖同名的第三方文件；systemd 整形单元限制文件系统访问和 Linux capability。
-- 受限 OpenVZ/LXC、无法精确重建的自定义 qdisc 会被拒绝；支持的 `fq`、`fq_codel`、`pfifo*` 会保存参数后恢复，常见 `mq` 多队列会额外保存并恢复每个受支持的叶子队列。
-- 回滚只有在所有受管 sysctl 都恢复成功后才删除快照；部分失败时保留证据并返回错误。
-- 终端提示为黄色；重定向日志时自动移除 ANSI 颜色。
-
-主脚本可能发生的外联只有用户请求的 iperf3/ping/TCP 测速，以及经确认后由系统包管理器安装 iperf3。安装器仅连接固定的 GitHub Release URL。对端和中间网络仍然能看到 VPS 的源 IP，因此涉及敏感机器时应使用自有 iperf3 对端。
-
-对参考项目 tcpfit v0.5.9 的逐项静态审阅见 [SECURITY-REVIEW-tcpfit.md](SECURITY-REVIEW-tcpfit.md)。
-
-## 支持范围
-
-需要 Linux、root、`sysctl`、`iproute2`。整形还需要 `tc` 与 systemd。Debian/Ubuntu、Rocky/Alma/CentOS、Fedora、Alpine 一般可用；缺少 BBR 或被容器限制 sysctl 时，工具会停止并说明原因。
-
-## 快速开始
-
-发布 v4.0.0 tag 并上传同名 Release 资产后，推荐先下载固定版本、检查内容，再运行安装器。安装器会再次用内置 SHA-256 校验固定的 GitHub Release 资产：
+SSH 登录 VPS 后，复制下面两行执行：
 
 ```bash
-curl -fLO https://raw.githubusercontent.com/elonjack/vps-tcp-safe-tuner/v4.0.0/install.sh
-less install.sh
+curl -fLO https://github.com/elonjack/vps-tcp-safe-tuner/releases/download/v4.0.0/install.sh
 bash install.sh
 ```
 
-在发布前或已经下载完整仓库时，可完全避免安装阶段再次联网；`--local` 仍会核对安装器内置哈希：
+安装器会校验下载脚本的 SHA-256，安装完成后通常会自动打开中文菜单。
+
+如果没有自动出现菜单，再执行：
+
+```bash
+sudo vps-tcp-tune
+```
+
+### 第二步：菜单选什么
+
+```text
+1) 自适应测试并调优
+2) 按已知带宽/RTT 调优
+3) 仅检测
+4) 查看状态
+5) 回滚
+0) 退出
+```
+
+大多数代理 VPS 选 `1`。接下来这样回答：
+
+1. “对端域名或 IPv4”直接按回车，让脚本选择公共测速节点。
+2. “用途”输入 `proxy`。
+3. 询问是否安装 iperf3 时输入 `y`。
+4. 询问是否允许公共测速节点时输入 `y`。测速节点会看到 VPS 的公网 IP。
+5. 脚本显示修改计划后，确认无误再输入 `y`。
+
+脚本会完成“调优前测速 → 临时应用参数 → 再次测速”。如果吞吐明显下降或重传明显增加，会自动恢复本次修改。
+
+### 第三步：以后怎么打开
+
+```bash
+sudo vps-tcp-tune
+```
+
+### 不满意怎么恢复
+
+先查看当前状态：
+
+```bash
+sudo vps-tcp-tune status
+```
+
+恢复第一次调优前的参数：
+
+```bash
+sudo vps-tcp-tune rollback
+```
+
+回滚只有在所有参数恢复成功后才会删除快照；如果部分恢复失败，快照会保留并提示检查。
+
+## 不想测速，只想按已知带宽调优
+
+下面以 `1000 Mbit/s`、典型 RTT `150 ms`、代理用途为例：
+
+```bash
+sudo vps-tcp-tune apply --bandwidth 1000 --rtt 150 --role proxy
+```
+
+把 `1000` 换成 VPS 套餐带宽。常见用途：
+
+| 用途 | 参数 |
+| --- | --- |
+| 代理、转发、流媒体 | `--role proxy` |
+| 普通 VPS | `--role general` |
+| 建站、服务端 | `--role server` |
+
+只查看计划、不修改系统：
+
+```bash
+sudo vps-tcp-tune apply --bandwidth 1000 --rtt 150 --role proxy --dry-run
+```
+
+## 常用命令
+
+| 想做什么 | 命令 |
+| --- | --- |
+| 打开中文菜单 | `sudo vps-tcp-tune` |
+| 只检查环境 | `sudo vps-tcp-tune audit` |
+| 自动测速并调优代理 VPS | `sudo vps-tcp-tune auto --role proxy --allow-public-peers` |
+| 查看状态 | `sudo vps-tcp-tune status` |
+| 回滚 | `sudo vps-tcp-tune rollback` |
+| 查看帮助 | `vps-tcp-tune --help` |
+
+## 运行前要知道
+
+- 只支持 Linux VPS，需要 root 或 `sudo`。
+- 自动模式会产生真实测速流量。单个阶段默认最多估算 20 GiB，超过会停止。
+- `--allow-public-peers` 表示允许连接内置第三方 iperf3 节点；对端会看到 VPS 的公网 IP。
+- 脚本不会修改防火墙、SSH、路由、swap，也不会下载新内核。
+- 默认不会替换当前活动 qdisc；只有明确执行整形命令才会修改。
+- OpenVZ/LXC 可能禁止 BBR、sysctl 或 qdisc，遇到限制时脚本会停止，不会强行修改。
+
+## 使用自己的测速服务器
+
+公共 iperf3 节点可能繁忙。想要更稳定的测试，可以在另一台 VPS 上运行：
+
+```bash
+iperf3 -s
+```
+
+然后在需要调优的 VPS 上执行：
+
+```bash
+sudo vps-tcp-tune auto --peer 你的服务器IP --role proxy
+```
+
+指定自己的对端时，不需要 `--allow-public-peers`。
+
+## 高流量和高级测试
+
+普通用户不需要这一节。
+
+默认流量上限为每个阶段 20 GiB。可以调低：
+
+```bash
+sudo vps-tcp-tune auto --role proxy --allow-public-peers --max-test-gib 5
+```
+
+如果确认套餐流量充足，才显式允许超过上限：
+
+```bash
+sudo vps-tcp-tune auto --role proxy --allow-public-peers --allow-high-traffic
+```
+
+搜索 1×、2×、3× BDP 缓冲区会额外测速：
+
+```bash
+sudo vps-tcp-tune auto --role proxy --allow-public-peers --search-buffers
+```
+
+`--yes` 不能代替公共节点授权或高流量授权。
+
+## 限速器与整形
+
+只有确认出口限速器导致重传或吞吐不稳时，才建议整形。扫描只给出建议，不会自动长期应用：
+
+```bash
+sudo vps-tcp-tune auto --role proxy --allow-public-peers --enable-shaping
+```
+
+根据扫描建议手动应用，例如建议值为 950 Mbit/s：
+
+```bash
+sudo vps-tcp-tune shape --shape-rate 950 --enable-shaping
+```
+
+移除本工具整形并恢复原 qdisc：
+
+```bash
+sudo vps-tcp-tune unshape
+```
+
+整形会短暂替换活动根 qdisc，应在业务低峰操作。无法精确恢复的自定义 qdisc 会被拒绝。
+
+## 安全设计
+
+- 主脚本没有遥测、运行计数、广告请求或自动更新。
+- 主脚本不会下载并执行远程代码。
+- 公共测速节点和高流量测试分别需要明确授权。
+- 首次修改前保存 sysctl 精确快照；本次实验另有事务快照。
+- 持久化文件使用原子写入和所有权标记，不覆盖同名第三方文件。
+- 写入 systemd 脚本前严格校验网卡名，整形服务限制文件系统权限和 capability。
+- 调优后使用同一对端复测；明显退化或无法完成验证时默认恢复。
+- 安装器固定 Release 版本并使用内置 SHA-256 校验主脚本。
+
+对参考项目 tcpfit v0.5.9 的静态安全审阅见 [SECURITY-REVIEW-tcpfit.md](SECURITY-REVIEW-tcpfit.md)。
+
+## 离线安装
+
+已经下载完整 Release 或仓库时：
 
 ```bash
 sha256sum -c SHA256SUMS
 sudo bash install.sh --local ./vps-tcp-tune.sh
 ```
 
-在交互终端中，安装完成会自动打开中文菜单；选择 1 即可完成测量、自动加载内核已有的 BBR、应用与复测。也可之后手动运行：
+## 支持范围
 
-```bash
-sudo vps-tcp-tune audit
-sudo vps-tcp-tune
-```
+需要 Linux、`sysctl` 和 `iproute2`。整形还需要 `tc` 与 systemd。Debian、Ubuntu、Rocky Linux、AlmaLinux、CentOS、Fedora 和 Alpine 一般可用。
 
-也可下载仓库中的脚本后手动执行：
-
-```bash
-chmod 755 vps-tcp-tune.sh
-sudo ./vps-tcp-tune.sh audit
-```
-
-省略 `--peer` 后，脚本可从内置公共 iperf3 节点中按 RTT 排序、多个端口短测后选择可用对端。交互运行会先说明第三方外联并询问授权；非交互运行必须明确添加 `--allow-public-peers`。默认只接受 RTT 不超过 120 ms 的节点，可通过 `--peer-max-rtt` 调整。公共节点可能满载或临时不可用；推荐指定自有或可信对端以获得更稳定的结果。
-
-最简单的一键调优：
-
-```bash
-sudo vps-tcp-tune
-```
-
-也可以明确使用自动公共节点：
-
-```bash
-sudo vps-tcp-tune auto --role proxy --rounds 3 --allow-public-peers
-```
-
-若需最可重复、最贴近业务目标的测量，推荐准备一台自有或可信的 iperf3 服务端：
-
-```bash
-iperf3 -s
-```
-
-指定对端的自适应调优：
-
-```bash
-sudo ./vps-tcp-tune.sh auto --peer YOUR_IPERF3_HOST --role proxy
-```
-
-该流程会先记录 3 轮基准、显示推导参数、确认后自动尝试 `modprobe tcp_bbr`，并以本工具专属配置让 BBR 在重启后加载，再应用参数并以同一对端复测 3 轮。自动测速会优先选近端以测出端口可用带宽，但**不会**把近端 RTT 用作跨境业务的 BDP：默认按 150 ms 业务目标 RTT 推导缓冲区。若实际用户主要在其他方向，可用 `--rtt` 覆盖，例如 `auto --rtt 180`。若内核确实没有 BBR 模块，工具会停止而不会下载模块或更换内核。若吞吐下降超过 15%、原本零重传而复测累计出现超过 10 次重传，或已有重传的情况下复测重传翻倍且超过 10 次容差，默认自动回滚。若复测对端不可用、有效轮次不足，候选参数不会持久化，脚本会恢复本次应用前的参数并显示最后一次 iperf3 错误。测速会优先尝试同一对端的备用端口，避免因为单个公共端口繁忙而误判。测速会消耗流量，默认每轮为 4 流、12 秒；可用 `--rounds 1` 到 `--rounds 5` 调整。已知带宽后，每个阶段会先估算流量，默认超过 20 GiB 就拒绝发送；可用 `--max-test-gib` 调低上限，或在确认套餐流量充足后显式加入 `--allow-high-traffic`。
-
-### 代理加速应怎样选择
-
-菜单中用途请选择 `proxy`。此模式的缓冲区上限按 2×BDP、业务 RTT 和内存推导；`tcp_rmem` 初始接收缓冲区为 1 MiB，使客户端请求和首包更快进入自动调节区间；`tcp_wmem` 初始发送缓冲区为 256 KiB，避免把代理响应过多堆在本机。TCP 自动调节仍可按需要增长至推导上限。`general` 保持内核默认的初始 TCP 缓冲区，适合普通 VPS；不会改动 UDP 等其他协议的全局 socket 默认缓冲区。
-
-测速报告里的“去程”通常是中国测试节点到 VPS，近似于代理客户端发出请求或上传数据；“回程”是 VPS 到中国测试节点，近似于网页、视频等响应数据。用于日常代理浏览和流媒体时，回程吞吐、丢包和延迟是主要指标；去程仍会影响握手、请求、上传和双向传输。
-
-若检测到活动根队列是既有 `HTB`，工具会显示其首个 class 速率，但不会覆盖它。HTB 可能来自商家、面板或其他调优工具；它会限制实际出站速度，需先确认来源，再决定是否移除或重新整形。
-
-如需进一步针对当前线路搜索缓冲区上限，可显式启用 A/B 搜索。该模式会额外进行 3 组、每组 2 轮测试，因此仅建议在流量充足且业务低峰时使用：
-
-```bash
-sudo vps-tcp-tune auto --role proxy --search-buffers --allow-public-peers
-```
-
-如果已知出口带宽与典型 RTT：
-
-```bash
-sudo ./vps-tcp-tune.sh apply --bandwidth 1000 --rtt 150 --role proxy
-```
-
-## 限速器与整形
-
-只有出口 policer 导致重传或吞吐不稳时，整形才可能改善代理/大流吞吐。启用 `--enable-shaping` 后，自动流程会从基线的 85% 到 145% 粗扫；每个候选默认独立测试 3 轮，并按基线重传噪声与至少 90% 的送达率共同判定。发现拐点后改用二分法精扫，在最佳候选下方保留 3% 余量。完成后只给出建议，不会自动持久化整形。
-
-可用 `--policer-rounds 2` 到 `--policer-rounds 5` 调整每个候选的测试轮数；更多轮次更稳，但会消耗更多测试流量。扫描中无论正常结束、报错退出或收到中断，都会先恢复扫描前的根 qdisc；遇到自定义或无法逐叶恢复的多队列配置时，脚本会拒绝扫描。
-
-```bash
-sudo ./vps-tcp-tune.sh shape --shape-rate 950 --enable-shaping
-sudo ./vps-tcp-tune.sh verify --peer YOUR_IPERF3_HOST
-```
-
-整形会短暂替换活动根 qdisc，必须在业务低峰执行。脚本只允许恢复把握足够的根队列类型；遇到多队列或自定义 qdisc 会拒绝操作。
-
-## 其他命令
-
-```bash
-sudo ./vps-tcp-tune.sh measure --peer YOUR_IPERF3_HOST
-sudo ./vps-tcp-tune.sh status
-sudo ./vps-tcp-tune.sh apply --bandwidth 1000 --rtt 150 --dry-run
-sudo ./vps-tcp-tune.sh rollback
-```
-
-## 开发
+## 开发测试
 
 ```bash
 bash -n vps-tcp-tune.sh
-shellcheck vps-tcp-tune.sh
+bash tests/test-shell.sh
+shellcheck vps-tcp-tune.sh install.sh tests/test-shell.sh
 powershell -ExecutionPolicy Bypass -File tests/test-static.ps1
 ```
-
-GitHub Actions 会执行 Bash 语法检查、ShellCheck 与静态安全断言。
 
 ## 许可证
 
