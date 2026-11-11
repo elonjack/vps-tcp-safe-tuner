@@ -6,7 +6,7 @@ set -Eeuo pipefail
 IFS=$'\n\t'
 umask 077
 
-readonly VERSION='4.1.0'
+readonly VERSION='5.0.0'
 readonly STATE_DIR='/var/lib/vps-tcp-safe-tuner'
 readonly SNAPSHOT_FILE="$STATE_DIR/baseline.tsv"
 readonly TRANSACTION_FILE="$STATE_DIR/transaction.tsv"
@@ -16,6 +16,7 @@ readonly LOCK_FILE='/run/lock/vps-tcp-safe-tuner.lock'
 readonly SHAPE_SCRIPT='/usr/local/sbin/vps-tcp-safe-tuner-qdisc'
 readonly SHAPE_UNIT='/etc/systemd/system/vps-tcp-safe-tuner-qdisc.service'
 readonly SHAPE_STATE="$STATE_DIR/qdisc.tsv"
+readonly QDISC_TUNE_STATE="$STATE_DIR/qdisc-tune.tsv"
 readonly BBR_MODULE_FILE='/etc/modules-load.d/vps-tcp-safe-tuner-bbr.conf'
 readonly REPORT_DIR='/var/log/vps-tcp-safe-tuner'
 readonly MARKER='# Managed by vps-tcp-safe-tuner. Remove only with vps-tcp-tune rollback.'
@@ -28,8 +29,9 @@ readonly RETRANS_PER_GIB_MARGIN='500'
 readonly RETRANS_RELATIVE_MULTIPLIER='3'
 
 COMMAND='menu'; ROLE='general'; PEER=''; PEER_PORT='5201'; BANDWIDTH_MBIT=''; RTT_MS=''
-DURATION='12'; WORKERS='4'; ROUNDS='3'; POLICER_ROUNDS='3'; PEER_MAX_RTT='120'; MAX_TEST_GIB='20'; MAX_RATE_SPREAD_PERCENT='40'; BUFFER_MULTIPLIER_OVERRIDE=''; SHAPE_RATE=''; ENABLE_SHAPING=0; BUFFER_SEARCH=0; DRY_RUN=0; ASSUME_YES=0; NO_INSTALL=0; KEEP_ON_REGRESSION=0; ALLOW_PUBLIC_PEERS=0; ALLOW_HIGH_TRAFFIC=0; BIDIRECTIONAL=1
+DURATION='12'; WORKERS='4'; ROUNDS='3'; POLICER_ROUNDS='3'; PEER_MAX_RTT='120'; MAX_TEST_GIB='20'; MAX_RATE_SPREAD_PERCENT='40'; BUFFER_MULTIPLIER_OVERRIDE=''; SHAPE_RATE=''; ENABLE_SHAPING=0; BUFFER_SEARCH=0; QDISC_EXPERIMENT=0; DRY_RUN=0; ASSUME_YES=0; NO_INSTALL=0; KEEP_ON_REGRESSION=0; ALLOW_PUBLIC_PEERS=0; ALLOW_HIGH_TRAFFIC=0; BIDIRECTIONAL=1
 TUNING_APPLIED=0; DEFER_PERSIST=0; BBR_MODULE_CONFIG_CREATED=0
+QDISC_SELECTED_FQ=0; QDISC_CHANGED=0; QDISC_ORIGINAL_IFACE=''; QDISC_ORIGINAL_KIND=''; QDISC_ORIGINAL_SPEC=''; QDISC_BACKUP_FILE=''
 
 # 第三方公开 iperf3 节点。自动模式会按 RTT 排序、依次做短测试；用户也可用 --peer 覆盖。
 # 节点可用性会变化，因此自动选择失败时会给出明确提示，不会伪造测量结果。
@@ -70,6 +72,7 @@ vps-tcp-tune - 自适应 Linux VPS TCP 调优工具
   audit                        只检测内核、虚拟化、网卡和 TCP 能力
   measure [--peer 主机]        多轮吞吐、重传、RTT 基线测试；省略对端则自动选择公共节点
   auto --peer 主机             实测后自动推导 BDP 并应用调优
+  deep --peer 主机             深度实验：缓冲区倍率 + 活动 FQ 队列双向 A/B 择优
   apply --bandwidth N --rtt N  按已知带宽/RTT 应用调优
   shape --shape-rate N         应用 HTB + FQ 出向整形（须先明确确认）
   unshape                      移除本工具的整形并恢复可恢复的根队列类型
@@ -95,6 +98,7 @@ vps-tcp-tune - 自适应 Linux VPS TCP 调优工具
   --forward-only       只测试 VPS 出站；默认同时测试出站和入站
   --enable-shaping     auto 成功后，允许进入限速器扫描和整形候选流程
   --search-buffers     对 1×、2×、3× BDP 缓冲区进行 A/B 测试并自动保留最佳候选
+  --experiment-qdisc   临时比较原活动 qdisc 与 FQ；只在双向结果更好时保留 FQ
   --shape-rate MBIT    shape 使用的目标速率
   --no-install         不允许脚本安装 iperf3
   --keep-on-regression 即使复测明显退化，也不自动回滚（默认会回滚）
@@ -106,6 +110,7 @@ vps-tcp-tune - 自适应 Linux VPS TCP 调优工具
   sudo bash vps-tcp-tune.sh auto --peer 203.0.113.10 --role proxy
   sudo bash vps-tcp-tune.sh auto --rounds 3 --role proxy
   sudo bash vps-tcp-tune.sh auto --rtt 180 --role proxy
+  sudo bash vps-tcp-tune.sh deep --peer 203.0.113.10 --role proxy
   sudo bash vps-tcp-tune.sh apply --bandwidth 1000 --rtt 150 --role proxy
   sudo bash vps-tcp-tune.sh shape --shape-rate 950 --enable-shaping
   sudo bash vps-tcp-tune.sh rollback
@@ -285,6 +290,7 @@ MEASURE_RATE=''; MEASURE_RETRANS=''; MEASURE_RETRANS_PER_GIB=''; MEASURE_TRANSFE
 MEASURE_REVERSE_RATE=''; MEASURE_REVERSE_RETRANS_PER_GIB=''; MEASURE_REVERSE_TRANSFER_MIB=''; MEASURE_REVERSE_RATE_SPREAD=''
 MEASURE_RTT=''; MEASURE_FAILURE=''
 DIRECTION_RATE=''; DIRECTION_RETRANS=''; DIRECTION_RETRANS_PER_GIB=''; DIRECTION_TRANSFER_MIB=''; DIRECTION_RATE_SPREAD=''
+MEASURE_STAGE_TRANSFER_MIB=0
 
 measure_rtt() {
   MEASURE_RTT=''; command -v ping >/dev/null 2>&1 || return 0
@@ -338,7 +344,7 @@ measure_direction() {
   temporary_file=$(mktemp)
   chmod 600 "$temporary_file"
   valid=0
-  required=$(( (ROUNDS + 1) / 2 ))
+  required=$(( ROUNDS / 2 + 1 ))
   say "开始${label} ${ROUNDS} 轮测试：并发=$WORKERS，单轮=${DURATION}s。"
   for ((round = 1; round <= ROUNDS; round += 1)); do
     if ! run_measure_iperf "$direction"; then
@@ -348,7 +354,14 @@ measure_direction() {
     rate=$MEASURE_RATE; retrans=$MEASURE_RETRANS; transfer_mib=$MEASURE_TRANSFER_MIB
     printf '%s\t%s\t%s\n' "$rate" "$retrans" "$transfer_mib" >>"$temporary_file"
     valid=$(( valid + 1 ))
+    MEASURE_STAGE_TRANSFER_MIB=$(( MEASURE_STAGE_TRANSFER_MIB + transfer_mib ))
     say "${label}第 $round 轮：${rate} Mbit/s，重传 ${retrans}，传输约 ${transfer_mib} MiB。"
+    if (( ALLOW_HIGH_TRAFFIC == 0 && MEASURE_STAGE_TRANSFER_MIB > MAX_TEST_GIB * 1024 )); then
+      rm -f "$temporary_file"
+      MEASURE_FAILURE="本阶段实际传输 ${MEASURE_STAGE_TRANSFER_MIB} MiB，已超过 ${MAX_TEST_GIB} GiB 上限"
+      warn "$MEASURE_FAILURE；停止剩余测速。需要继续时显式加入 --allow-high-traffic。"
+      return 1
+    fi
   done
   if (( valid < required )); then
     rm -f "$temporary_file"
@@ -377,6 +390,7 @@ measure() {
   [[ -n $PEER ]] || auto_pick_peer
   validate_peer
   local tests=$ROUNDS combined_mib
+  MEASURE_STAGE_TRANSFER_MIB=0
   MEASURE_REVERSE_RATE=''; MEASURE_REVERSE_RETRANS_PER_GIB=''; MEASURE_REVERSE_TRANSFER_MIB=''; MEASURE_REVERSE_RATE_SPREAD=''
   (( BIDIRECTIONAL )) && tests=$(( ROUNDS * 2 ))
   guard_test_traffic '本轮测速' "$BANDWIDTH_MBIT" "$tests" || return 1
@@ -451,13 +465,33 @@ calculate_backlog() { if (( BANDWIDTH_MBIT >= 5000 )); then printf 20000; elif (
 
 declare -a KEYS=() VALUES=()
 add_setting() { sysctl_exists "$1" || { warn "内核不支持 $1，已跳过。"; return 0; }; KEYS+=("$1"); VALUES+=("$2"); }
+set_setting_value() {
+  local wanted=$1 value=$2 index
+  for index in "${!KEYS[@]}"; do
+    if [[ ${KEYS[$index]} == "$wanted" ]]; then VALUES[$index]=$value; return 0; fi
+  done
+  return 1
+}
+drop_setting() {
+  local wanted=$1 index
+  local -a kept_keys=() kept_values=()
+  for index in "${!KEYS[@]}"; do
+    [[ ${KEYS[$index]} == "$wanted" ]] && continue
+    kept_keys+=("${KEYS[$index]}"); kept_values+=("${VALUES[$index]}")
+  done
+  KEYS=("${kept_keys[@]}"); VALUES=("${kept_values[@]}")
+}
 build_settings() {
   local buffer initial_rmem initial_wmem backlog socket_queue syn_queue
   KEYS=(); VALUES=()
   buffer=$(calculate_buffer); initial_rmem=$(calculate_initial_rmem "$buffer"); initial_wmem=$(calculate_initial_wmem "$buffer"); backlog=$(calculate_backlog); case "$ROLE" in proxy|server) socket_queue=8192; syn_queue=8192 ;; *) socket_queue=4096; syn_queue=4096 ;; esac
   # default_qdisc 只影响以后新建/重建的队列，当前活动根 qdisc 不会随 sysctl 立即变化。
-  # 为保证调优前后测试的是同一队列，本工具不再在基础调优中改它；整形是独立显式操作。
+  # 标准调优不改它；深度模式会把当前值纳入事务，再单独对活动 FQ 做可恢复 A/B。
   add_setting net.ipv4.tcp_congestion_control bbr
+  # 深度实验先把当前默认值纳入事务，只有活动 FQ 的双向 A/B 胜出后才改成 fq。
+  if (( QDISC_EXPERIMENT )); then add_setting net.core.default_qdisc "$(sysctl_value net.core.default_qdisc)"
+  elif [[ -f $QDISC_TUNE_STATE ]]; then add_setting net.core.default_qdisc fq
+  fi
   add_setting net.core.rmem_max "$buffer"; add_setting net.core.wmem_max "$buffer"
   add_setting net.ipv4.tcp_rmem "4096 $initial_rmem $buffer"; add_setting net.ipv4.tcp_wmem "4096 $initial_wmem $buffer"
   add_setting net.ipv4.tcp_mtu_probing 1; add_setting net.ipv4.tcp_slow_start_after_idle 0; add_setting net.ipv4.tcp_moderate_rcvbuf 1
@@ -486,7 +520,8 @@ show_plan() {
   local i buffer initial_rmem initial_wmem; buffer=$(calculate_buffer); initial_rmem=$(calculate_initial_rmem "$buffer"); initial_wmem=$(calculate_initial_wmem "$buffer"); show_environment
   say "用途=$ROLE；带宽=${BANDWIDTH_MBIT} Mbit/s；业务目标 RTT=${RTT_MS} ms；推导缓冲区上限=${buffer} 字节；初始接收/发送缓冲区=${initial_rmem}/${initial_wmem} 字节。"
   for i in "${!KEYS[@]}"; do say "${KEYS[$i]}：$(sysctl_value "${KEYS[$i]}") -> ${VALUES[$i]}"; done
-  say '基础调优保留默认及活动 qdisc，确保前后复测队列一致；只有明确执行 shape 时才会改动活动队列。'
+  if (( QDISC_EXPERIMENT )); then say '基础候选先保持原活动 qdisc；深度阶段会临时 A/B 测试 FQ，未胜出即精确恢复。'
+  else say '基础调优保留默认及活动 qdisc，确保前后复测队列一致；只有明确执行 shape 时才会改动活动队列。'; fi
 }
 
 snapshot_if_needed() {
@@ -534,10 +569,11 @@ abort_transaction() {
 }
 write_facts() {
   install -d -m 700 "$STATE_DIR"
-  local tmp
+  local tmp selected_qdisc=unchanged
+  if (( QDISC_SELECTED_FQ )) || [[ -f $QDISC_TUNE_STATE ]]; then selected_qdisc=fq; fi
   tmp=$(mktemp "$STATE_DIR/facts.XXXXXX") || return 1
   chmod 600 "$tmp" || { rm -f "$tmp"; return 1; }
-  if ! { printf 'role\t%s\n' "$ROLE"; printf 'bandwidth_mbit\t%s\n' "$BANDWIDTH_MBIT"; printf 'target_rtt_ms\t%s\n' "$RTT_MS"; printf 'test_peer_rtt_ms\t%s\n' "${MEASURE_RTT:-}"; printf 'buffer_bdp_multiplier\t%s\n' "${BUFFER_MULTIPLIER_OVERRIDE:-default}"; printf 'tcp_initial_rmem\t%s\n' "$(calculate_initial_rmem "$(calculate_buffer)")"; printf 'tcp_initial_wmem\t%s\n' "$(calculate_initial_wmem "$(calculate_buffer)")"; printf 'peer\t%s\n' "$PEER"; printf 'measured_egress_mbit\t%s\n' "${MEASURE_RATE:-}"; printf 'measured_egress_retrans_per_gib\t%s\n' "${MEASURE_RETRANS_PER_GIB:-}"; printf 'measured_egress_spread_percent\t%s\n' "${MEASURE_RATE_SPREAD:-}"; printf 'measured_ingress_mbit\t%s\n' "${MEASURE_REVERSE_RATE:-}"; printf 'measured_ingress_retrans_per_gib\t%s\n' "${MEASURE_REVERSE_RETRANS_PER_GIB:-}"; printf 'measured_ingress_spread_percent\t%s\n' "${MEASURE_REVERSE_RATE_SPREAD:-}"; printf 'facts_end\t1\n'; } >"$tmp"; then
+  if ! { printf 'role\t%s\n' "$ROLE"; printf 'bandwidth_mbit\t%s\n' "$BANDWIDTH_MBIT"; printf 'target_rtt_ms\t%s\n' "$RTT_MS"; printf 'test_peer_rtt_ms\t%s\n' "${MEASURE_RTT:-}"; printf 'buffer_bdp_multiplier\t%s\n' "${BUFFER_MULTIPLIER_OVERRIDE:-default}"; printf 'selected_qdisc\t%s\n' "$selected_qdisc"; printf 'tcp_initial_rmem\t%s\n' "$(calculate_initial_rmem "$(calculate_buffer)")"; printf 'tcp_initial_wmem\t%s\n' "$(calculate_initial_wmem "$(calculate_buffer)")"; printf 'peer\t%s\n' "$PEER"; printf 'measured_egress_mbit\t%s\n' "${MEASURE_RATE:-}"; printf 'measured_egress_retrans_per_gib\t%s\n' "${MEASURE_RETRANS_PER_GIB:-}"; printf 'measured_egress_spread_percent\t%s\n' "${MEASURE_RATE_SPREAD:-}"; printf 'measured_ingress_mbit\t%s\n' "${MEASURE_REVERSE_RATE:-}"; printf 'measured_ingress_retrans_per_gib\t%s\n' "${MEASURE_REVERSE_RETRANS_PER_GIB:-}"; printf 'measured_ingress_spread_percent\t%s\n' "${MEASURE_REVERSE_RATE_SPREAD:-}"; printf 'facts_end\t1\n'; } >"$tmp"; then
     rm -f "$tmp"; return 1
   fi
   tail -n 1 "$tmp" | grep -Fqx $'facts_end\t1' || { rm -f "$tmp"; return 1; }
@@ -592,10 +628,23 @@ REGRESSION_REASON=''
 revert_auto_experiment() {
   warn '复测失败或出现明显退化，正在恢复本次应用前的 TCP 参数。'
   if abort_transaction; then
-    ok '已恢复本次实验前的参数；实验报告仍保留。'
-    return 0
+    if restore_qdisc_experiment; then
+      ok '已恢复本次实验前的 TCP 参数及活动 qdisc；实验报告仍保留。'
+      return 0
+    fi
+    warn 'TCP 参数已恢复，但活动 qdisc 恢复失败；队列快照仍保留。'
+    return 1
   fi
+  restore_qdisc_experiment >/dev/null 2>&1 || true
   return 1
+}
+abort_auto_on_signal() {
+  warn '收到中断信号，正在恢复本次自动实验。'
+  if (( TUNING_APPLIED )); then
+    abort_transaction >/dev/null 2>&1 || true
+    restore_qdisc_experiment >/dev/null 2>&1 || true
+  fi
+  exit 130
 }
 write_config() {
   local tmp i; tmp=$(mktemp "${CONFIG_FILE}.XXXXXX") || return 1
@@ -629,10 +678,11 @@ restore_legacy_core_defaults() {
     sysctl -q -w "$key=$saved" || return 1
     say "已恢复不再管理的 $key。"
   done
-  if grep -Fqx 'net.core.default_qdisc = fq' "$CONFIG_FILE" && [[ $(sysctl_value net.core.default_qdisc) == fq ]]; then
+  if [[ ! -f $QDISC_TUNE_STATE ]] && grep -Fqx 'net.core.default_qdisc = fq' "$CONFIG_FILE" && [[ $(sysctl_value net.core.default_qdisc) == fq ]]; then
     saved=$(awk -F'\t' '$1 == "net.core.default_qdisc" { print $2; exit }' "$SNAPSHOT_FILE")
     if [[ -n $saved ]]; then
       sysctl -q -w "net.core.default_qdisc=$saved" || return 1
+      (( QDISC_EXPERIMENT == 0 )) || set_setting_value net.core.default_qdisc "$saved"
       say "已恢复旧版曾修改但未参与活动队列复测的 net.core.default_qdisc=$saved。"
     fi
   fi
@@ -645,8 +695,14 @@ apply_built_settings() {
 }
 apply_tuning() {
   TUNING_APPLIED=0
+  (( QDISC_EXPERIMENT == 0 || DEFER_PERSIST == 1 )) || fail '--experiment-qdisc 只能配合 auto/deep 使用，不能配合 apply。'
   require_root; require_linux; require_command sysctl; require_command ip; require_command tc; lock; validate_common; derive_network_facts; build_settings; show_plan
-  (( DRY_RUN )) && { ok '预览完成，未修改系统。'; return 0; }; confirm '将自动启用内核已有的 BBR（如尚未加载）、写入 sysctl、保存精确快照并立即应用自适应 TCP 参数。继续吗？' || { say '已取消。'; return 0; }
+  (( DRY_RUN )) && { ok '预览完成，未修改系统。'; return 0; }
+  if (( QDISC_EXPERIMENT )); then
+    confirm '将启用内核已有的 BBR、临时应用候选 sysctl，并在保存精确快照后进行缓冲区及活动 FQ 队列 A/B 实验。继续吗？' || { say '已取消。'; return 0; }
+  else
+    confirm '将自动启用内核已有的 BBR（如尚未加载）、写入 sysctl、保存精确快照并立即应用自适应 TCP 参数。继续吗？' || { say '已取消。'; return 0; }
+  fi
   ensure_bbr
   snapshot_if_needed
   snapshot_transaction
@@ -672,8 +728,8 @@ apply_tuning() {
   fi
 }
 search_buffer_candidates() {
-  local saved_override=$BUFFER_MULTIPLIER_OVERRIDE saved_rounds=$ROUNDS candidate candidate_rate candidate_retrans candidate_reverse_retrans
-  local best_multiplier='' best_rate=0 best_retrans=0 best_reverse_retrans=0 search_tests=6
+  local saved_override=$BUFFER_MULTIPLIER_OVERRIDE saved_rounds=$ROUNDS candidate candidate_rate candidate_retrans candidate_reverse_rate candidate_reverse_retrans candidate_score
+  local best_multiplier='' best_rate=0 best_reverse_rate=0 best_retrans=0 best_reverse_retrans=0 best_score=0 search_tests=6
   local -a candidates=(1 2 3)
   (( BIDIRECTIONAL )) && search_tests=12
   guard_test_traffic 'BDP 缓冲区搜索' "$BANDWIDTH_MBIT" "$search_tests" || { warn '已跳过高流量缓冲区搜索，保留默认 2× BDP 候选。'; return 0; }
@@ -684,17 +740,21 @@ search_buffer_candidates() {
     BUFFER_MULTIPLIER_OVERRIDE=$candidate
     build_settings
     if ! apply_built_settings; then
-      warn "${candidate}× BDP 参数无法应用，已跳过。"
-      continue
+      warn "${candidate}× BDP 参数只应用了一部分，正在恢复整个实验。"
+      abort_transaction || fail '缓冲区候选应用失败，且部分参数未能恢复；事务快照已保留。'
+      fail '缓冲区候选应用失败，已恢复实验前参数。'
     fi
     if ! measure; then
       warn "${candidate}× BDP 的测量不足，已跳过该候选。"
       continue
     fi
-    candidate_rate=$MEASURE_RATE; candidate_retrans=$MEASURE_RETRANS_PER_GIB; candidate_reverse_retrans=${MEASURE_REVERSE_RETRANS_PER_GIB:-0}
-    say "${candidate}× BDP：出站 ${candidate_rate}Mbit，重传 ${candidate_retrans} 次/GiB；入站重传 ${candidate_reverse_retrans} 次/GiB。"
-    if (( candidate_retrans <= RETRANS_PER_GIB_HARD_LIMIT && candidate_reverse_retrans <= RETRANS_PER_GIB_HARD_LIMIT && candidate_rate > best_rate )); then
-      best_multiplier=$candidate; best_rate=$candidate_rate; best_retrans=$candidate_retrans; best_reverse_retrans=$candidate_reverse_retrans
+    candidate_rate=$MEASURE_RATE; candidate_retrans=$MEASURE_RETRANS_PER_GIB
+    candidate_reverse_rate=${MEASURE_REVERSE_RATE:-0}; candidate_reverse_retrans=${MEASURE_REVERSE_RETRANS_PER_GIB:-0}
+    candidate_score=$candidate_rate; (( BIDIRECTIONAL == 0 )) || candidate_score=$(( candidate_score + candidate_reverse_rate ))
+    say "${candidate}× BDP：出站/入站 ${candidate_rate}/${candidate_reverse_rate} Mbit；重传 ${candidate_retrans}/${candidate_reverse_retrans} 次/GiB。"
+    if (( candidate_retrans <= RETRANS_PER_GIB_HARD_LIMIT && candidate_reverse_retrans <= RETRANS_PER_GIB_HARD_LIMIT && candidate_score > best_score )); then
+      best_multiplier=$candidate; best_rate=$candidate_rate; best_reverse_rate=$candidate_reverse_rate
+      best_retrans=$candidate_retrans; best_reverse_retrans=$candidate_reverse_retrans; best_score=$candidate_score
     fi
   done
   ROUNDS=$saved_rounds
@@ -708,7 +768,7 @@ search_buffer_candidates() {
   BUFFER_MULTIPLIER_OVERRIDE=$best_multiplier
   build_settings
   apply_built_settings || { abort_transaction || fail '最佳缓冲区候选应用失败，且部分参数未能恢复；事务快照已保留。'; fail '最佳缓冲区候选应用失败，已恢复本次应用前参数。'; }
-  say "已选择 ${best_multiplier}× BDP 缓冲区：${best_rate}Mbit，出站/入站重传 ${best_retrans}/${best_reverse_retrans} 次/GiB。"
+  say "已选择 ${best_multiplier}× BDP 缓冲区：出站/入站 ${best_rate}/${best_reverse_rate}Mbit，重传 ${best_retrans}/${best_reverse_retrans} 次/GiB。"
 }
 
 qdisc_leaf_is_restorable() { case "$1" in fq|fq_codel|pfifo_fast|pfifo|bfifo) return 0 ;; *) return 1 ;; esac; }
@@ -773,7 +833,145 @@ restore_root_qdisc() {
   tc qdisc replace dev "$iface" root "$kind" "${arguments[@]}"
 }
 remove_qdisc_snapshot() {
-  [[ ${1:-} == "$STATE_DIR"/qdisc-before-shape.* || ${1:-} == "$STATE_DIR"/qdisc-scan.* ]] && rm -f -- "$1"
+  [[ ${1:-} == "$STATE_DIR"/qdisc-before-shape.* || ${1:-} == "$STATE_DIR"/qdisc-scan.* || ${1:-} == "$STATE_DIR"/qdisc-lab.* ]] && rm -f -- "$1"
+}
+active_qdisc_is_fq() {
+  local iface=$1 output root
+  output=$(tc qdisc show dev "$iface" 2>/dev/null) || return 1
+  root=$(awk '$1 == "qdisc" {for (i = 1; i <= NF; i += 1) if ($i == "root") {print $2; exit}}' <<<"$output")
+  [[ $root == fq ]] && return 0
+  [[ $root == mq ]] || return 1
+  awk '
+    $1 == "qdisc" && $0 ~ / parent / {leaves += 1; if ($2 != "fq") bad = 1}
+    END {exit !(leaves > 0 && bad == 0)}
+  ' <<<"$output"
+}
+apply_fq_candidate() {
+  local iface=$1 original_kind=$2 snapshot_file=$3 kind parent ignored_spec minor found=0
+  if [[ $original_kind != mq ]]; then
+    tc qdisc replace dev "$iface" root fq
+    return
+  fi
+  [[ -f $snapshot_file ]] || return 1
+  tc qdisc replace dev "$iface" root handle 1: mq || return 1
+  while IFS=$'\t' read -r kind parent ignored_spec; do
+    qdisc_leaf_is_restorable "$kind" || return 1
+    [[ $parent =~ ^(:|[0-9]+:)[1-9][0-9]*$ ]] || return 1
+    minor=${parent##*:}
+    tc qdisc replace dev "$iface" parent "1:$minor" fq || return 1
+    found=1
+  done <"$snapshot_file"
+  (( found ))
+}
+qdisc_candidate_is_better() {
+  local base_rate=$1 base_retrans=$2 base_reverse_rate=$3 base_reverse_retrans=$4
+  local candidate_rate=$5 candidate_retrans=$6 candidate_reverse_rate=$7 candidate_reverse_retrans=$8
+  local base_total candidate_total
+  is_material_regression "$base_rate" "$base_retrans" "$candidate_rate" "$candidate_retrans" 'FQ 出站' && return 1
+  (( candidate_rate * 100 >= base_rate * 95 )) || return 1
+  base_total=$base_rate; candidate_total=$candidate_rate
+  if (( BIDIRECTIONAL )); then
+    is_material_regression "$base_reverse_rate" "$base_reverse_retrans" "$candidate_reverse_rate" "$candidate_reverse_retrans" 'FQ 入站' && return 1
+    (( candidate_reverse_rate * 100 >= base_reverse_rate * 95 )) || return 1
+    base_total=$(( base_total + base_reverse_rate )); candidate_total=$(( candidate_total + candidate_reverse_rate ))
+  fi
+  (( candidate_total * 100 >= base_total * 105 ))
+}
+clear_qdisc_experiment_globals() {
+  QDISC_SELECTED_FQ=0; QDISC_CHANGED=0; QDISC_ORIGINAL_IFACE=''; QDISC_ORIGINAL_KIND=''; QDISC_ORIGINAL_SPEC=''; QDISC_BACKUP_FILE=''
+}
+restore_qdisc_experiment() {
+  (( QDISC_CHANGED )) || return 0
+  restore_root_qdisc "$QDISC_ORIGINAL_IFACE" "$QDISC_ORIGINAL_KIND" "$QDISC_ORIGINAL_SPEC" || return 1
+  rm -f "$QDISC_TUNE_STATE"
+  remove_qdisc_snapshot "$QDISC_BACKUP_FILE"
+  clear_qdisc_experiment_globals
+}
+persist_qdisc_tune_state() {
+  (( QDISC_SELECTED_FQ )) || return 0
+  [[ ! -e $QDISC_TUNE_STATE ]] || return 0
+  local tmp
+  tmp=$(mktemp "$STATE_DIR/qdisc-tune.XXXXXX") || return 1
+  chmod 600 "$tmp" || { rm -f "$tmp"; return 1; }
+  printf '%s\t%s\t%s\n' "$QDISC_ORIGINAL_IFACE" "$QDISC_ORIGINAL_KIND" "$QDISC_ORIGINAL_SPEC" >"$tmp" || { rm -f "$tmp"; return 1; }
+  mv -f "$tmp" "$QDISC_TUNE_STATE"
+}
+restore_managed_qdisc_tune() {
+  local iface kind spec
+  [[ -f $QDISC_TUNE_STATE ]] || return 0
+  IFS=$'\t' read -r iface kind spec <"$QDISC_TUNE_STATE"
+  validate_iface "$iface"; qdisc_is_restorable "$kind" || return 1
+  restore_root_qdisc "$iface" "$kind" "$spec" || return 1
+  remove_qdisc_snapshot "$spec"
+  rm -f "$QDISC_TUNE_STATE"
+  clear_qdisc_experiment_globals
+}
+search_qdisc_candidate() {
+  local iface snapshot saved_rounds qdisc_tests=4
+  local base_rate base_retrans base_reverse_rate base_reverse_retrans
+  local candidate_rate candidate_retrans candidate_reverse_rate candidate_reverse_retrans
+  if [[ -f $QDISC_TUNE_STATE ]]; then
+    QDISC_SELECTED_FQ=1
+    set_setting_value net.core.default_qdisc fq || return 1
+    say '活动 FQ 已由此前深度实验保留，本次不重复替换队列。'
+    return 0
+  fi
+  (( BIDIRECTIONAL == 0 )) || qdisc_tests=8
+  guard_test_traffic '活动 qdisc A/B 实验' "$BANDWIDTH_MBIT" "$qdisc_tests" || {
+    warn '已跳过高流量 FQ 实验；此前 TCP 候选仍会接受最终复测。'; drop_setting net.core.default_qdisc; return 0;
+  }
+  iface=$(default_interface); [[ -n $iface ]] || { warn '未检测到默认出口网卡，已跳过 FQ 实验。'; drop_setting net.core.default_qdisc; return 0; }
+  validate_iface "$iface"
+  if active_qdisc_is_fq "$iface"; then
+    say '当前活动队列已经是 FQ；保持用户现有队列，不接管其持久化。'
+    drop_setting net.core.default_qdisc
+    return 0
+  fi
+  install -d -m 700 "$STATE_DIR"
+  QDISC_BACKUP_FILE=$(mktemp "$STATE_DIR/qdisc-lab.XXXXXX")
+  snapshot=$(qdisc_snapshot "$iface" "$QDISC_BACKUP_FILE") || {
+    rm -f -- "$QDISC_BACKUP_FILE"; QDISC_BACKUP_FILE=''; drop_setting net.core.default_qdisc
+    warn '当前活动 qdisc 无法精确恢复，已安全跳过 FQ 实验。'; return 0;
+  }
+  IFS=$'\t' read -r QDISC_ORIGINAL_KIND QDISC_ORIGINAL_SPEC <<<"$snapshot"
+  QDISC_ORIGINAL_IFACE=$iface
+  if [[ $QDISC_ORIGINAL_KIND != mq ]]; then rm -f -- "$QDISC_BACKUP_FILE"; QDISC_BACKUP_FILE=''; fi
+  saved_rounds=$ROUNDS; ROUNDS=2
+  say "深度实验：先测当前活动队列 $QDISC_ORIGINAL_KIND，再临时切换 FQ；每个候选测试两轮。"
+  if ! measure; then
+    ROUNDS=$saved_rounds; remove_qdisc_snapshot "$QDISC_BACKUP_FILE"; clear_qdisc_experiment_globals
+    drop_setting net.core.default_qdisc; warn '当前队列候选测量不稳定，已跳过 FQ 实验。'; return 0
+  fi
+  base_rate=$MEASURE_RATE; base_retrans=$MEASURE_RETRANS_PER_GIB
+  base_reverse_rate=${MEASURE_REVERSE_RATE:-0}; base_reverse_retrans=${MEASURE_REVERSE_RETRANS_PER_GIB:-0}
+  if ! apply_fq_candidate "$iface" "$QDISC_ORIGINAL_KIND" "$QDISC_ORIGINAL_SPEC"; then
+    ROUNDS=$saved_rounds
+    restore_root_qdisc "$iface" "$QDISC_ORIGINAL_KIND" "$QDISC_ORIGINAL_SPEC" >/dev/null 2>&1 || fail 'FQ 候选应用失败，且原活动 qdisc 未能恢复，请立即检查网络。'
+    remove_qdisc_snapshot "$QDISC_BACKUP_FILE"; clear_qdisc_experiment_globals; drop_setting net.core.default_qdisc
+    warn 'FQ 候选无法应用，已恢复原活动 qdisc。'; return 0
+  fi
+  QDISC_CHANGED=1
+  if ! measure; then
+    ROUNDS=$saved_rounds
+    restore_qdisc_experiment || fail 'FQ 候选测量失败，且原活动 qdisc 未能恢复，请立即检查网络。'
+    drop_setting net.core.default_qdisc; warn 'FQ 候选测量不稳定，已恢复原活动 qdisc。'; return 0
+  fi
+  candidate_rate=$MEASURE_RATE; candidate_retrans=$MEASURE_RETRANS_PER_GIB
+  candidate_reverse_rate=${MEASURE_REVERSE_RATE:-0}; candidate_reverse_retrans=${MEASURE_REVERSE_RETRANS_PER_GIB:-0}
+  ROUNDS=$saved_rounds
+  say "队列对比：原队列出站/入站 ${base_rate}/${base_reverse_rate} Mbit；FQ ${candidate_rate}/${candidate_reverse_rate} Mbit。"
+  if qdisc_candidate_is_better "$base_rate" "$base_retrans" "$base_reverse_rate" "$base_reverse_retrans" "$candidate_rate" "$candidate_retrans" "$candidate_reverse_rate" "$candidate_reverse_retrans"; then
+    if ! set_setting_value net.core.default_qdisc fq || ! sysctl -q -w net.core.default_qdisc=fq; then
+      restore_qdisc_experiment || fail 'FQ 持久化失败，且原活动 qdisc 未能恢复，请立即检查网络。'
+      drop_setting net.core.default_qdisc; warn 'FQ 无法写入持久配置，已恢复原活动 qdisc。'; return 0
+    fi
+    QDISC_SELECTED_FQ=1
+    ok 'FQ 双向综合吞吐至少提升 5%，且单方向下降未超过 5%；已选择 FQ 候选。'
+    return 0
+  fi
+  restore_qdisc_experiment || fail 'FQ 未胜出，且原活动 qdisc 未能恢复，请立即检查网络。'
+  drop_setting net.core.default_qdisc
+  say 'FQ 未达到双向择优门槛，已恢复原活动 qdisc。'
 }
 managed_file_or_absent() {
   local path=$1 marker=$2
@@ -959,6 +1157,7 @@ auto() {
   local baseline_rate baseline_retrans_per_gib baseline_reverse_rate baseline_reverse_retrans_per_gib
   local after_rate after_retrans_per_gib after_reverse_rate after_reverse_retrans_per_gib decision regressed=0 regression_reasons=''
   require_root; require_linux; validate_common
+  trap abort_auto_on_signal INT TERM HUP
   say '阶段 1/3：记录调优前基线。'
   if ! measure; then
     fail '调优前基线不足，未改动系统。请稍后重试或指定可信 iperf3 对端。'
@@ -978,10 +1177,14 @@ auto() {
   DEFER_PERSIST=1
   apply_tuning
   DEFER_PERSIST=0
-  (( TUNING_APPLIED )) || { say '候选配置未应用，已结束实验。'; return 0; }
+  (( TUNING_APPLIED )) || { trap - INT TERM HUP; say '候选配置未应用，已结束实验。'; return 0; }
   if (( BUFFER_SEARCH )); then
     say '附加阶段：搜索当前线路更合适的 BDP 缓冲区倍率。'
     search_buffer_candidates
+  fi
+  if (( QDISC_EXPERIMENT )); then
+    say '附加阶段：比较原活动队列与 FQ 候选。'
+    search_qdisc_candidate
   fi
   say '阶段 3/3：使用同一对端、同一轮次复测。'
   if ! measure; then
@@ -989,6 +1192,7 @@ auto() {
     write_experiment_report "$baseline_rate" "$baseline_retrans_per_gib" '' '' "$decision" "$baseline_reverse_rate" "$baseline_reverse_retrans_per_gib" '' ''
     warn "复测不足，候选参数不予保留。最后一次 iperf3 错误：${MEASURE_FAILURE:-未取得}"
     revert_auto_experiment
+    trap - INT TERM HUP
     return 0
   fi
   after_rate=$MEASURE_RATE; after_retrans_per_gib=$MEASURE_RETRANS_PER_GIB
@@ -1010,49 +1214,59 @@ auto() {
   write_experiment_report "$baseline_rate" "$baseline_retrans_per_gib" "$after_rate" "$after_retrans_per_gib" "$decision" "$baseline_reverse_rate" "$baseline_reverse_retrans_per_gib" "$after_reverse_rate" "$after_reverse_retrans_per_gib"
   if [[ $decision == rolled_back_regression ]]; then
     revert_auto_experiment
+    trap - INT TERM HUP
     return 0
   fi
-  if ! write_facts || ! write_config; then
+  if ! persist_qdisc_tune_state || ! write_facts || ! write_config; then
     warn '复测通过，但持久化文件写入失败，正在恢复实验前参数。'
-    abort_transaction || fail '持久化失败，且部分参数未能恢复；事务快照已保留。'
+    revert_auto_experiment || fail '持久化失败，且部分参数或活动 qdisc 未能恢复；事务快照与队列快照均已保留。'
     fail '持久化失败，已恢复实验前参数。'
   fi
   discard_transaction
+  trap - INT TERM HUP
   ok '复测未出现明显退化，已保留候选 TCP 配置。'
   if (( ENABLE_SHAPING )); then
     if [[ $MEASURE_RETRANS_PER_GIB == 0 ]]; then say '验证无重传，跳过限速器扫描。';
     else warn '已启用限速器候选扫描。扫描只给出建议，不会持久化整形。'; scan_shaper_candidate; fi
   fi
 }
+deep() {
+  BUFFER_SEARCH=1; QDISC_EXPERIMENT=1
+  warn '深度模式会额外测试 1×/2×/3× BDP 与活动 FQ 候选，流量和耗时明显高于标准模式。'
+  auto
+}
 
 audit() {
   require_linux; require_command sysctl; require_command ip; show_environment
   if kernel_supports_bbr; then say 'BBR 可用：是'; else say 'BBR 可用：否'; fi
   say "sysctl 配置目录：$([[ -d /etc/sysctl.d ]] && echo 可用 || echo 缺失)"; say "iperf3：$(command -v iperf3 >/dev/null 2>&1 && echo 已安装 || echo 未安装)"; say "systemd：$(command -v systemctl >/dev/null 2>&1 && echo 可用 || echo 不可用)"
-  say '提示：选菜单 1 或 2 调优时，脚本会自动尝试加载内核已有的 tcp_bbr；OpenVZ/LXC 可能拒绝部分 sysctl 或 qdisc。'
+  say '提示：选菜单 1、2 或 3 调优时，脚本会自动尝试加载内核已有的 tcp_bbr；OpenVZ/LXC 可能拒绝部分 sysctl 或 qdisc。'
 }
 status() {
   require_linux; require_command sysctl; show_environment
   [[ -f $CONFIG_FILE ]] && { say "持久化配置：$CONFIG_FILE"; yellow "$(sed -n '1,30p' "$CONFIG_FILE")"; printf '\n'; } || warn '未检测到本工具 sysctl 配置。'
   [[ -f $FACTS_FILE ]] && { say '上次调优事实：'; yellow "$(cat "$FACTS_FILE")"; printf '\n'; }
   [[ -f $SNAPSHOT_FILE ]] && say "可回滚快照：$SNAPSHOT_FILE" || say '没有 sysctl 快照。'; [[ -f $SHAPE_STATE ]] && say "已存在本工具整形：$(tr '\t' ' ' <"$SHAPE_STATE")" || say '没有本工具整形。'
+  [[ -f $QDISC_TUNE_STATE ]] && say "深度实验保留了 FQ；原活动队列快照：$(tr '\t' ' ' <"$QDISC_TUNE_STATE")" || say '没有深度实验管理的活动 qdisc。'
   if [[ -f $TRANSACTION_FILE ]]; then warn '检测到未完成的调优事务；请重新运行调优或执行回滚后再继续。'; fi
 }
 rollback() {
   require_root; require_linux; require_command sysctl; lock; [[ -f $SNAPSHOT_FILE ]] || fail '未找到首次快照；拒绝猜测系统原始值。'
-  (( DRY_RUN )) && { say '将恢复 sysctl 快照并移除本工具配置和整形。'; return 0; }; confirm '恢复首次 sysctl 快照并移除本工具的持久化配置/整形吗？' || { say '已取消。'; return 0; }
+  (( DRY_RUN )) && { say '将恢复 sysctl 与活动 qdisc 快照，并移除本工具配置和整形。'; return 0; }; confirm '恢复首次 sysctl/活动 qdisc 快照并移除本工具的持久化配置和整形吗？' || { say '已取消。'; return 0; }
   [[ -f $SHAPE_STATE ]] && { ASSUME_YES=1; unshape; }
   restore_snapshot_values || fail "部分 sysctl 恢复失败；配置和快照均已保留，请检查后重试：$SNAPSHOT_FILE"
-  remove_bbr_module_config; rm -f "$CONFIG_FILE" "$SNAPSHOT_FILE" "$FACTS_FILE" "$TRANSACTION_FILE"; rmdir "$STATE_DIR" 2>/dev/null || true; ok '已恢复快照并清理本工具创建的持久化文件。'
+  restore_managed_qdisc_tune || fail "sysctl 已恢复，但活动 qdisc 恢复失败；队列状态仍保留：$QDISC_TUNE_STATE"
+  remove_bbr_module_config; rm -f "$CONFIG_FILE" "$SNAPSHOT_FILE" "$FACTS_FILE" "$TRANSACTION_FILE"; rmdir "$STATE_DIR" 2>/dev/null || true; ok '已恢复 sysctl 与活动 qdisc 快照，并清理本工具创建的持久化文件。'
 }
 menu() {
   require_linux; line; say "VPS TCP 自适应调优器 v$VERSION"; line
   yellow "$(cat <<'EOF'
 1) 自适应测试并调优（需要可信 iperf3 对端）
-2) 按已知带宽/RTT 调优
-3) 仅检测
-4) 查看状态
-5) 回滚
+2) 深度自适应实验（缓冲区 + FQ 双向 A/B，流量较大）
+3) 按已知带宽/RTT 调优
+4) 仅检测
+5) 查看状态
+6) 回滚
 0) 退出
 EOF
 )"
@@ -1060,19 +1274,20 @@ EOF
   local choice; yellow '请选择：'; read -r choice
   case "$choice" in
     1) yellow '[对端域名或 IPv4，回车自动选择公共节点] '; read -r PEER; yellow '[用途 general=通用 / proxy=代理加速 / server=建站服务，默认 general] '; read -r ROLE; ROLE=${ROLE:-general}; auto ;;
-    2) yellow '[带宽 Mbit] '; read -r BANDWIDTH_MBIT; yellow '[典型 RTT ms] '; read -r RTT_MS; yellow '[用途 general=通用 / proxy=代理加速 / server=建站服务，默认 general] '; read -r ROLE; ROLE=${ROLE:-general}; apply_tuning ;;
-    3) audit ;; 4) status ;; 5) rollback ;; 0) say '已退出。' ;; *) fail '无效选择。' ;;
+    2) yellow '[对端域名或 IPv4，回车自动选择公共节点] '; read -r PEER; yellow '[用途 general=通用 / proxy=代理加速 / server=建站服务，默认 general] '; read -r ROLE; ROLE=${ROLE:-general}; deep ;;
+    3) yellow '[带宽 Mbit] '; read -r BANDWIDTH_MBIT; yellow '[典型 RTT ms] '; read -r RTT_MS; yellow '[用途 general=通用 / proxy=代理加速 / server=建站服务，默认 general] '; read -r ROLE; ROLE=${ROLE:-general}; apply_tuning ;;
+    4) audit ;; 5) status ;; 6) rollback ;; 0) say '已退出。' ;; *) fail '无效选择。' ;;
   esac
 }
 parse_options() {
   while (($#)); do case "$1" in
     --peer) PEER=${2:-}; shift 2 ;; --port) PEER_PORT=${2:-}; shift 2 ;; --role) ROLE=${2:-}; shift 2 ;; --bandwidth) BANDWIDTH_MBIT=${2:-}; shift 2 ;; --rtt) RTT_MS=${2:-}; shift 2 ;; --duration) DURATION=${2:-}; shift 2 ;; --workers) WORKERS=${2:-}; shift 2 ;; --rounds) ROUNDS=${2:-}; shift 2 ;; --policer-rounds) POLICER_ROUNDS=${2:-}; shift 2 ;; --peer-max-rtt) PEER_MAX_RTT=${2:-}; shift 2 ;; --max-test-gib) MAX_TEST_GIB=${2:-}; shift 2 ;; --max-rate-spread) MAX_RATE_SPREAD_PERCENT=${2:-}; shift 2 ;; --shape-rate) SHAPE_RATE=${2:-}; shift 2 ;;
-    --enable-shaping) ENABLE_SHAPING=1; shift ;; --search-buffers) BUFFER_SEARCH=1; shift ;; --allow-public-peers) ALLOW_PUBLIC_PEERS=1; shift ;; --allow-high-traffic) ALLOW_HIGH_TRAFFIC=1; shift ;; --forward-only) BIDIRECTIONAL=0; shift ;; --dry-run) DRY_RUN=1; shift ;; --yes) ASSUME_YES=1; shift ;; --no-install) NO_INSTALL=1; shift ;; --keep-on-regression) KEEP_ON_REGRESSION=1; shift ;; -h|--help) usage; exit 0 ;; *) fail "未知选项：$1" ;;
+    --enable-shaping) ENABLE_SHAPING=1; shift ;; --search-buffers) BUFFER_SEARCH=1; shift ;; --experiment-qdisc) QDISC_EXPERIMENT=1; shift ;; --allow-public-peers) ALLOW_PUBLIC_PEERS=1; shift ;; --allow-high-traffic) ALLOW_HIGH_TRAFFIC=1; shift ;; --forward-only) BIDIRECTIONAL=0; shift ;; --dry-run) DRY_RUN=1; shift ;; --yes) ASSUME_YES=1; shift ;; --no-install) NO_INSTALL=1; shift ;; --keep-on-regression) KEEP_ON_REGRESSION=1; shift ;; -h|--help) usage; exit 0 ;; *) fail "未知选项：$1" ;;
   esac; done
 }
 main() {
   COMMAND=${1:-menu}; shift || true; parse_options "$@"
-  case "$COMMAND" in menu) menu ;; audit) audit ;; measure|verify) measure ;; auto) auto ;; apply) apply_tuning ;; shape) shape ;; unshape) unshape ;; status) status ;; rollback) rollback ;; help|-h|--help) usage ;; *) fail "未知命令：$COMMAND" ;; esac
+  case "$COMMAND" in menu) menu ;; audit) audit ;; measure|verify) measure ;; auto) auto ;; deep) deep ;; apply) apply_tuning ;; shape) shape ;; unshape) unshape ;; status) status ;; rollback) rollback ;; help|-h|--help) usage ;; *) fail "未知命令：$COMMAND" ;; esac
 }
 if [[ ${VPS_TCP_TUNE_LIBRARY:-0} != 1 ]]; then
   main "$@"

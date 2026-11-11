@@ -26,14 +26,15 @@ export ALLOW_HIGH_TRAFFIC=1
 guard_test_traffic '测试流量护栏' 10000 3 >/dev/null 2>&1 || { printf '显式高流量授权未生效。\n' >&2; exit 1; }
 export MAX_TEST_GIB=20 ALLOW_HIGH_TRAFFIC=0
 
-parse_options --peer-max-rtt 80 --max-test-gib 5 --max-rate-spread 35 --allow-public-peers --allow-high-traffic --forward-only
+parse_options --peer-max-rtt 80 --max-test-gib 5 --max-rate-spread 35 --allow-public-peers --allow-high-traffic --forward-only --experiment-qdisc
 assert_equals 80 "$PEER_MAX_RTT" '公共节点 RTT 参数解析'
 assert_equals 5 "$MAX_TEST_GIB" '流量上限参数解析'
 assert_equals 35 "$MAX_RATE_SPREAD_PERCENT" '多轮波动阈值参数解析'
 assert_equals 1 "$ALLOW_PUBLIC_PEERS" '公共节点显式授权参数解析'
 assert_equals 1 "$ALLOW_HIGH_TRAFFIC" '高流量显式授权参数解析'
 assert_equals 0 "$BIDIRECTIONAL" '仅出站参数解析'
-export PEER_MAX_RTT=120 MAX_TEST_GIB=20 MAX_RATE_SPREAD_PERCENT=40 ALLOW_PUBLIC_PEERS=0 ALLOW_HIGH_TRAFFIC=0 BIDIRECTIONAL=1
+assert_equals 1 "$QDISC_EXPERIMENT" '活动 qdisc 实验参数解析'
+export PEER_MAX_RTT=120 MAX_TEST_GIB=20 MAX_RATE_SPREAD_PERCENT=40 ALLOW_PUBLIC_PEERS=0 ALLOW_HIGH_TRAFFIC=0 BIDIRECTIONAL=1 QDISC_EXPERIMENT=0
 
 export BANDWIDTH_MBIT=284
 export RTT_MS=150
@@ -71,6 +72,11 @@ MEASURE_FIXTURE=stable TEST_INDEX=0
 measure_direction forward '出站' >/dev/null 2>&1 || { printf '稳定基线被错误拒绝。\n' >&2; exit 1; }
 assert_equals 1550 "$DIRECTION_RATE" '稳定样本中位吞吐'
 assert_equals 6 "$DIRECTION_RATE_SPREAD" '稳定样本波动率'
+export ROUNDS=1 MAX_TEST_GIB=1 MEASURE_STAGE_TRANSFER_MIB=0
+MEASURE_FIXTURE=stable TEST_INDEX=0
+if measure_direction forward '出站' >/dev/null 2>&1; then printf '实际传输量运行中护栏未生效。\n' >&2; exit 1; fi
+[[ $MEASURE_FAILURE == *'实际传输'* ]] || { printf '实际流量护栏失败原因缺失。\n' >&2; exit 1; }
+export ROUNDS=3 MAX_TEST_GIB=20 MEASURE_STAGE_TRANSFER_MIB=0
 
 tc() {
   if [[ $1 == class && $2 == show ]]; then
@@ -78,10 +84,11 @@ tc() {
     return 0
   fi
   if [[ $1 == qdisc && $2 == show ]]; then
-    if [[ ${TC_FIXTURE:-single} == mq ]]; then
+    if [[ ${TC_FIXTURE:-single} == mq || ${TC_FIXTURE:-single} == mq_fq ]]; then
       printf '%s\n' 'qdisc mq 0: root'
       printf '%s\n' 'qdisc fq 0: parent :1 limit 10000p pacing'
-      printf '%s\n' 'qdisc fq_codel 0: parent :2 limit 2048p flows 512 target 5.0ms interval 100.0ms ecn'
+      if [[ ${TC_FIXTURE:-single} == mq_fq ]]; then printf '%s\n' 'qdisc fq 0: parent :2 limit 10000p pacing'
+      else printf '%s\n' 'qdisc fq_codel 0: parent :2 limit 2048p flows 512 target 5.0ms interval 100.0ms ecn'; fi
     else
       printf '%s\n' 'qdisc fq_codel 0: root refcnt 2 limit 2048p flows 512 target 5.0ms interval 100.0ms ecn'
     fi
@@ -97,6 +104,20 @@ snapshot=$(qdisc_snapshot eth0 "$mq_snapshot")
 assert_equals $'mq\t'"$mq_snapshot" "$snapshot" 'mq 根队列快照'
 assert_equals $'fq\t:1\tlimit 10000p pacing\nfq_codel\t:2\tlimit 2048p flows 512 target 5.0ms interval 100.0ms ecn' "$(cat "$mq_snapshot")" 'mq 叶子队列参数快照'
 rm -f "$mq_snapshot"
+if active_qdisc_is_fq eth0; then printf '混合 mq 叶子被误判为全 FQ。\n' >&2; exit 1; fi
+TC_FIXTURE=mq_fq
+active_qdisc_is_fq eth0 || { printf '全 FQ 的 mq 叶子未被识别。\n' >&2; exit 1; }
+
+KEYS=(one two three); VALUES=(1 2 3)
+set_setting_value two 22 || { printf '候选设置更新失败。\n' >&2; exit 1; }
+assert_equals 22 "${VALUES[1]}" '候选设置值更新'
+drop_setting two
+assert_equals 'one three' "${KEYS[0]} ${KEYS[1]}" '候选设置删除'
+
+export BIDIRECTIONAL=1
+qdisc_candidate_is_better 100 1000 100 1000 106 1000 106 1000 || { printf '双向提升的 FQ 候选未被选择。\n' >&2; exit 1; }
+if qdisc_candidate_is_better 100 1000 100 1000 120 1000 94 1000; then printf '单方向退化的 FQ 候选被错误选择。\n' >&2; exit 1; fi
+if qdisc_candidate_is_better 100 1000 100 1000 106 4000 106 1000; then printf '高重传 FQ 候选被错误选择。\n' >&2; exit 1; fi
 
 policer_candidate_is_clean 950 1800 1000 0 || { printf '限速器干净候选判断失败。\n' >&2; exit 1; }
 if policer_candidate_is_clean 800 0 1000 0; then printf '限速器送达率判断失败。\n' >&2; exit 1; fi

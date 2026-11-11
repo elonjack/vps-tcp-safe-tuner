@@ -11,7 +11,7 @@
 SSH 登录 VPS 后，复制下面两行执行：
 
 ```bash
-curl -fLO https://github.com/elonjack/vps-tcp-safe-tuner/releases/download/v4.1.0/install.sh
+curl -fLO https://github.com/elonjack/vps-tcp-safe-tuner/releases/download/v5.0.0/install.sh
 bash install.sh
 ```
 
@@ -27,10 +27,11 @@ sudo vps-tcp-tune
 
 ```text
 1) 自适应测试并调优
-2) 按已知带宽/RTT 调优
-3) 仅检测
-4) 查看状态
-5) 回滚
+2) 深度自适应实验（缓冲区 + FQ 双向 A/B，流量较大）
+3) 按已知带宽/RTT 调优
+4) 仅检测
+5) 查看状态
+6) 回滚
 0) 退出
 ```
 
@@ -43,6 +44,10 @@ sudo vps-tcp-tune
 5. 脚本显示修改计划后，确认无误再输入 `y`。
 
 脚本会完成“调优前测速 → 临时应用参数 → 再次测速”。如果吞吐明显下降或重传明显增加，会自动恢复本次修改。
+
+想进一步追求性能、且套餐流量充足时选 `2`。它会额外比较 1×/2×/3× BDP 缓冲区，并临时测试活动 FQ 队列；只有双向综合吞吐至少提高 5%、任一方向下降不超过 5%，且重传没有明显恶化，才会保留候选。否则恢复原活动队列。
+
+第一次建议先选 `1`。确认标准模式稳定后，再在业务低峰使用 `2`。
 
 ### 第三步：以后怎么打开
 
@@ -95,6 +100,7 @@ sudo vps-tcp-tune apply --bandwidth 1000 --rtt 150 --role proxy --dry-run
 | 打开中文菜单 | `sudo vps-tcp-tune` |
 | 只检查环境 | `sudo vps-tcp-tune audit` |
 | 自动测速并调优代理 VPS | `sudo vps-tcp-tune auto --role proxy --allow-public-peers` |
+| 深度实验并自动择优 | `sudo vps-tcp-tune deep --role proxy --allow-public-peers` |
 | 查看状态 | `sudo vps-tcp-tune status` |
 | 回滚 | `sudo vps-tcp-tune rollback` |
 | 查看帮助 | `vps-tcp-tune --help` |
@@ -102,13 +108,13 @@ sudo vps-tcp-tune apply --bandwidth 1000 --rtt 150 --role proxy --dry-run
 ## 运行前要知道
 
 - 只支持 Linux VPS，需要 root 或 `sudo`。
-- 自动模式会产生真实测速流量。单个阶段默认最多估算 20 GiB，超过会停止。
+- 自动模式会产生真实测速流量。每个测量阶段默认上限 20 GiB；除了事前估算，还会按实际传输字节在运行中停止后续测试。
 - 默认分别测试 VPS 出站和入站，并按实际传输量计算“每 GiB 重传次数”。
 - 三轮吞吐波动超过 40% 时会判定公共节点不稳定，在修改系统之前停止。
 - 流量有限时可在高级命令末尾加 `--forward-only`，只测 VPS 出站；判断会少一个方向的证据。
 - `--allow-public-peers` 表示允许连接内置第三方 iperf3 节点；对端会看到 VPS 的公网 IP。
 - 脚本不会修改防火墙、SSH、路由、swap，也不会下载新内核。
-- 默认不会替换当前活动 qdisc；只有明确执行整形命令才会修改。
+- 标准模式不会替换当前活动 qdisc；深度模式会临时测试 FQ，未达到择优门槛会恢复精确快照。
 - OpenVZ/LXC 可能禁止 BBR、sysctl 或 qdisc，遇到限制时脚本会停止，不会强行修改。
 
 ## 使用自己的测速服务器
@@ -149,6 +155,12 @@ sudo vps-tcp-tune auto --role proxy --allow-public-peers --allow-high-traffic
 sudo vps-tcp-tune auto --role proxy --allow-public-peers --search-buffers
 ```
 
+直接运行完整深度实验（等价于开启缓冲区搜索和活动 FQ 实验）：
+
+```bash
+sudo vps-tcp-tune deep --role proxy --allow-public-peers
+```
+
 `--yes` 不能代替公共节点授权或高流量授权。
 
 ## 限速器与整形
@@ -182,7 +194,7 @@ sudo vps-tcp-tune unshape
 - 持久化文件使用原子写入和所有权标记，不覆盖同名第三方文件。
 - 写入 systemd 脚本前严格校验网卡名，整形服务限制文件系统权限和 capability。
 - 调优后使用同一对端复测；明显退化或无法完成验证时默认恢复。
-- 基础调优保持当前 qdisc 不变，保证调优前后使用同一队列进行 A/B 对比。
+- 标准调优保持当前 qdisc 不变；深度模式分别测量原队列和 FQ，并为活动队列保存独立回滚快照。
 - 安装器固定 Release 版本并使用内置 SHA-256 校验主脚本。
 
 对参考项目 tcpfit v0.5.9 的静态安全审阅见 [SECURITY-REVIEW-tcpfit.md](SECURITY-REVIEW-tcpfit.md)。
