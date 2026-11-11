@@ -6,7 +6,7 @@ set -Eeuo pipefail
 IFS=$'\n\t'
 umask 077
 
-readonly VERSION='4.0.0'
+readonly VERSION='4.1.0'
 readonly STATE_DIR='/var/lib/vps-tcp-safe-tuner'
 readonly SNAPSHOT_FILE="$STATE_DIR/baseline.tsv"
 readonly TRANSACTION_FILE="$STATE_DIR/transaction.tsv"
@@ -23,9 +23,12 @@ readonly BBR_MODULE_MARKER='# Managed by vps-tcp-safe-tuner: load BBR at boot.'
 readonly SHAPE_SCRIPT_MARKER='# Managed by vps-tcp-safe-tuner: egress shaper helper.'
 readonly SHAPE_UNIT_MARKER='# Managed by vps-tcp-safe-tuner: egress shaper unit.'
 readonly AUTO_TARGET_RTT_MS='150'
+readonly RETRANS_PER_GIB_HARD_LIMIT='2000'
+readonly RETRANS_PER_GIB_MARGIN='500'
+readonly RETRANS_RELATIVE_MULTIPLIER='3'
 
 COMMAND='menu'; ROLE='general'; PEER=''; PEER_PORT='5201'; BANDWIDTH_MBIT=''; RTT_MS=''
-DURATION='12'; WORKERS='4'; ROUNDS='3'; POLICER_ROUNDS='3'; PEER_MAX_RTT='120'; MAX_TEST_GIB='20'; BUFFER_MULTIPLIER_OVERRIDE=''; SHAPE_RATE=''; ENABLE_SHAPING=0; BUFFER_SEARCH=0; DRY_RUN=0; ASSUME_YES=0; NO_INSTALL=0; KEEP_ON_REGRESSION=0; ALLOW_PUBLIC_PEERS=0; ALLOW_HIGH_TRAFFIC=0
+DURATION='12'; WORKERS='4'; ROUNDS='3'; POLICER_ROUNDS='3'; PEER_MAX_RTT='120'; MAX_TEST_GIB='20'; MAX_RATE_SPREAD_PERCENT='40'; BUFFER_MULTIPLIER_OVERRIDE=''; SHAPE_RATE=''; ENABLE_SHAPING=0; BUFFER_SEARCH=0; DRY_RUN=0; ASSUME_YES=0; NO_INSTALL=0; KEEP_ON_REGRESSION=0; ALLOW_PUBLIC_PEERS=0; ALLOW_HIGH_TRAFFIC=0; BIDIRECTIONAL=1
 TUNING_APPLIED=0; DEFER_PERSIST=0; BBR_MODULE_CONFIG_CREATED=0
 
 # 第三方公开 iperf3 节点。自动模式会按 RTT 排序、依次做短测试；用户也可用 --peer 覆盖。
@@ -88,6 +91,8 @@ vps-tcp-tune - 自适应 Linux VPS TCP 调优工具
   --allow-public-peers 明确允许探测并测速内置第三方公共节点；非交互自动选择时必需
   --max-test-gib N     单个阶段允许的估算流量上限，默认 20 GiB
   --allow-high-traffic 明确允许超过流量上限；--yes 不会代替此授权
+  --max-rate-spread N  多轮吞吐最大波动百分比，默认 40；超出则拒绝据此调优
+  --forward-only       只测试 VPS 出站；默认同时测试出站和入站
   --enable-shaping     auto 成功后，允许进入限速器扫描和整形候选流程
   --search-buffers     对 1×、2×、3× BDP 缓冲区进行 A/B 测试并自动保留最佳候选
   --shape-rate MBIT    shape 使用的目标速率
@@ -185,6 +190,7 @@ validate_common() {
   is_positive_integer "$POLICER_ROUNDS" && (( POLICER_ROUNDS >= 2 && POLICER_ROUNDS <= 5 )) || fail '--policer-rounds 必须是 2 到 5 的整数。'
   is_positive_integer "$PEER_MAX_RTT" && (( PEER_MAX_RTT <= 1000 )) || fail '--peer-max-rtt 必须是 1 到 1000 的整数。'
   is_positive_integer "$MAX_TEST_GIB" && (( MAX_TEST_GIB <= 10000 )) || fail '--max-test-gib 必须是 1 到 10000 的整数。'
+  is_positive_integer "$MAX_RATE_SPREAD_PERCENT" && (( MAX_RATE_SPREAD_PERCENT <= 200 )) || fail '--max-rate-spread 必须是 1 到 200 的整数。'
   [[ -z $BANDWIDTH_MBIT ]] || { is_positive_integer "$BANDWIDTH_MBIT" && (( BANDWIDTH_MBIT <= 100000 )) || fail '--bandwidth 必须是 1 到 100000 的整数。'; }
   [[ -z $RTT_MS ]] || { is_positive_integer "$RTT_MS" && (( RTT_MS <= 3000 )) || fail '--rtt 必须是 1 到 3000 的整数。'; }
 }
@@ -253,6 +259,14 @@ ensure_iperf3() {
 rate_to_mbit() {
   awk -v n="$1" -v u="$2" 'BEGIN {if(u~/^K/)n=n/1000; else if(u~/^G/)n=n*1000; else if(u~/^T/)n=n*1000000; printf "%.0f",n}'
 }
+transfer_to_mib() {
+  awk -v n="$1" -v u="$2" 'BEGIN {if(u=="Bytes")n=n/1048576; else if(u=="KBytes")n=n/1024; else if(u=="GBytes")n=n*1024; else if(u=="TBytes")n=n*1048576; printf "%.0f",n}'
+}
+retrans_per_gib() {
+  local retrans=$1 transfer_mib=$2
+  (( transfer_mib > 0 )) || { printf '0'; return; }
+  awk -v r="$retrans" -v m="$transfer_mib" 'BEGIN {printf "%.0f", r*1024/m}'
+}
 guard_test_traffic() {
   local label=$1 rate=$2 tests=$3 estimated_gib
   is_positive_integer "$rate" || return 0
@@ -267,7 +281,10 @@ guard_test_traffic() {
   warn "$MEASURE_FAILURE；未发送该阶段测速流量。需要继续时显式加入 --allow-high-traffic。"
   return 1
 }
-MEASURE_RATE=''; MEASURE_RETRANS=''; MEASURE_RTT=''; MEASURE_FAILURE=''
+MEASURE_RATE=''; MEASURE_RETRANS=''; MEASURE_RETRANS_PER_GIB=''; MEASURE_TRANSFER_MIB=''; MEASURE_RATE_SPREAD=''
+MEASURE_REVERSE_RATE=''; MEASURE_REVERSE_RETRANS_PER_GIB=''; MEASURE_REVERSE_TRANSFER_MIB=''; MEASURE_REVERSE_RATE_SPREAD=''
+MEASURE_RTT=''; MEASURE_FAILURE=''
+DIRECTION_RATE=''; DIRECTION_RETRANS=''; DIRECTION_RETRANS_PER_GIB=''; DIRECTION_TRANSFER_MIB=''; DIRECTION_RATE_SPREAD=''
 
 measure_rtt() {
   MEASURE_RTT=''; command -v ping >/dev/null 2>&1 || return 0
@@ -276,22 +293,30 @@ measure_rtt() {
   [[ -n $summary ]] && MEASURE_RTT=$(awk -F/ '{printf "%.0f",$2}' <<<"$summary")
 }
 parse_iperf_result() {
-  local output=$1 raw raw_rate raw_unit
+  local output=$1 raw transfer raw_rate raw_unit raw_transfer raw_transfer_unit
   raw=$(awk '$NF == "receiver" {for(i=1;i<=NF;i++)if($i~/^[KMGTP]?bits\/sec$/){rate=$(i-1);unit=$i}} END{if(rate!="")print rate,unit}' <<<"$output")
   [[ -n $raw ]] || return 1
   raw_rate=${raw%% *}; raw_unit=${raw##* }; MEASURE_RATE=$(rate_to_mbit "$raw_rate" "$raw_unit")
   MEASURE_RETRANS=$(awk '$NF == "sender" {value=$(NF-1)} END{if(value!="")print value;else print 0}' <<<"$output")
+  transfer=$(awk '$NF == "sender" {for(i=1;i<=NF;i++)if($i~/^(Bytes|KBytes|MBytes|GBytes|TBytes)$/){amount=$(i-1);unit=$i}} END{if(amount!="")print amount,unit}' <<<"$output")
+  [[ -n $transfer && $MEASURE_RETRANS =~ ^[0-9]+$ ]] || return 1
+  raw_transfer=${transfer%% *}; raw_transfer_unit=${transfer##* }
+  MEASURE_TRANSFER_MIB=$(transfer_to_mib "$raw_transfer" "$raw_transfer_unit")
+  (( MEASURE_TRANSFER_MIB > 0 )) || return 1
 }
 compact_iperf_error() {
   awk 'NF {line=$0} END {gsub(/[[:cntrl:]]/, " ", line); if (line != "") print substr(line, 1, 180)}' <<<"$1"
 }
 run_measure_iperf() {
-  local port output last_error='' seen=''
+  local direction=${1:-forward} port output last_error='' seen=''
+  local -a command=()
   MEASURE_FAILURE=''
   for port in "$PEER_PORT" "${IPERF_PORTS[@]}"; do
     [[ " $seen " == *" $port "* ]] && continue
     seen+=" $port"
-    output=$(timeout "$(( DURATION + 15 ))" iperf3 -c "$PEER" -p "$port" -P "$WORKERS" -t "$DURATION" --omit 2 2>&1) || {
+    command=(timeout "$(( DURATION + 15 ))" iperf3 -c "$PEER" -p "$port" -P "$WORKERS" -t "$DURATION" --omit 2)
+    [[ $direction == reverse ]] && command+=(-R)
+    output=$("${command[@]}" 2>&1) || {
       last_error=$(compact_iperf_error "$output")
       continue
     }
@@ -307,42 +332,74 @@ run_measure_iperf() {
   MEASURE_FAILURE=${last_error:-"对端 $PEER 的全部 iperf3 端口无响应或测试超时"}
   return 1
 }
-measure() {
-  require_linux; require_command timeout; validate_common; ensure_iperf3
-  [[ -n $PEER ]] || auto_pick_peer
-  validate_peer
-  local temporary_file round valid required rate retrans median_position estimated_mb
-  guard_test_traffic '本轮测速' "$BANDWIDTH_MBIT" "$ROUNDS" || return 1
+measure_direction() {
+  local direction=$1 label=$2 temporary_file round valid required rate retrans transfer_mib median_position minimum maximum
+  DIRECTION_RATE=''; DIRECTION_RETRANS=''; DIRECTION_RETRANS_PER_GIB=''; DIRECTION_TRANSFER_MIB=''; DIRECTION_RATE_SPREAD=''
   temporary_file=$(mktemp)
   chmod 600 "$temporary_file"
   valid=0
   required=$(( (ROUNDS + 1) / 2 ))
-  say "开始 ${ROUNDS} 轮测试：对端=$PEER:$PEER_PORT，并发=$WORKERS，单轮=${DURATION}s。"
-  say '测试会产生实际流量；为降低偶发波动影响，最终使用有效轮次的中位吞吐。'
+  say "开始${label} ${ROUNDS} 轮测试：并发=$WORKERS，单轮=${DURATION}s。"
   for ((round = 1; round <= ROUNDS; round += 1)); do
-    if ! run_measure_iperf; then
-      warn "第 $round 轮测试失败（已尝试同一对端的备用端口）：$MEASURE_FAILURE"
+    if ! run_measure_iperf "$direction"; then
+      warn "${label}第 $round 轮失败（已尝试同一对端的备用端口）：$MEASURE_FAILURE"
       continue
     fi
-    rate=$MEASURE_RATE; retrans=$MEASURE_RETRANS
-    printf '%s\t%s\n' "$rate" "$retrans" >>"$temporary_file"
+    rate=$MEASURE_RATE; retrans=$MEASURE_RETRANS; transfer_mib=$MEASURE_TRANSFER_MIB
+    printf '%s\t%s\t%s\n' "$rate" "$retrans" "$transfer_mib" >>"$temporary_file"
     valid=$(( valid + 1 ))
-    say "第 $round 轮：${rate} Mbit/s，重传 ${retrans}。"
+    say "${label}第 $round 轮：${rate} Mbit/s，重传 ${retrans}，传输约 ${transfer_mib} MiB。"
   done
   if (( valid < required )); then
     rm -f "$temporary_file"
-    warn "仅 $valid/$ROUNDS 轮测试有效，少于所需的 $required 轮；拒绝据此调优。"
+    MEASURE_FAILURE="${label}仅 $valid/$ROUNDS 轮有效，少于所需的 $required 轮"
+    warn "$MEASURE_FAILURE；拒绝据此调优。"
     return 1
   fi
   median_position=$(( (valid + 1) / 2 ))
-  MEASURE_RATE=$(sort -n -k 1,1 "$temporary_file" | awk -v position="$median_position" 'NR == position {print $1}')
-  MEASURE_RETRANS=$(awk -F'\t' '{total += $2} END {printf "%.0f", total}' "$temporary_file")
-  estimated_mb=$(awk -v rate="$MEASURE_RATE" -v seconds="$DURATION" -v count="$valid" 'BEGIN {printf "%.0f", rate * seconds * count / 8}')
+  DIRECTION_RATE=$(sort -n -k 1,1 "$temporary_file" | awk -v position="$median_position" 'NR == position {print $1}')
+  DIRECTION_RETRANS=$(awk -F'\t' '{total += $2} END {printf "%.0f", total}' "$temporary_file")
+  DIRECTION_TRANSFER_MIB=$(awk -F'\t' '{total += $3} END {printf "%.0f", total}' "$temporary_file")
+  minimum=$(sort -n -k 1,1 "$temporary_file" | awk 'NR==1{print $1}')
+  maximum=$(sort -n -k 1,1 "$temporary_file" | awk 'END{print $1}')
+  DIRECTION_RATE_SPREAD=$(awk -v low="$minimum" -v high="$maximum" -v median="$DIRECTION_RATE" 'BEGIN {if(median>0)printf "%.0f",(high-low)*100/median;else print 999}')
+  DIRECTION_RETRANS_PER_GIB=$(retrans_per_gib "$DIRECTION_RETRANS" "$DIRECTION_TRANSFER_MIB")
   rm -f "$temporary_file"
+  if (( DIRECTION_RATE_SPREAD > MAX_RATE_SPREAD_PERCENT )); then
+    MEASURE_FAILURE="${label}多轮吞吐波动 ${DIRECTION_RATE_SPREAD}%（${minimum}-${maximum} Mbit/s），超过 ${MAX_RATE_SPREAD_PERCENT}% 上限"
+    warn "$MEASURE_FAILURE；当前对端或线路不稳定，拒绝据此调优。"
+    return 1
+  fi
+  say "${label}汇总：中位 ${DIRECTION_RATE} Mbit/s；重传 ${DIRECTION_RETRANS}；约 ${DIRECTION_RETRANS_PER_GIB} 次/GiB；波动 ${DIRECTION_RATE_SPREAD}%。"
+}
+measure() {
+  require_linux; require_command timeout; validate_common; ensure_iperf3
+  [[ -n $PEER ]] || auto_pick_peer
+  validate_peer
+  local tests=$ROUNDS combined_mib
+  MEASURE_REVERSE_RATE=''; MEASURE_REVERSE_RETRANS_PER_GIB=''; MEASURE_REVERSE_TRANSFER_MIB=''; MEASURE_REVERSE_RATE_SPREAD=''
+  (( BIDIRECTIONAL )) && tests=$(( ROUNDS * 2 ))
+  guard_test_traffic '本轮测速' "$BANDWIDTH_MBIT" "$tests" || return 1
+  if (( BIDIRECTIONAL )); then
+    say "测速对端=$PEER:$PEER_PORT；先测 VPS 出站，再用 iperf3 -R 测 VPS 入站。"
+  else
+    say "测速对端=$PEER:$PEER_PORT；本次按 --forward-only 只测 VPS 出站。"
+  fi
+  say '多轮吞吐波动超过阈值时会判定样本不可靠，不会用于调优。'
+  if ! measure_direction forward '出站'; then return 1; fi
+  MEASURE_RATE=$DIRECTION_RATE; MEASURE_RETRANS=$DIRECTION_RETRANS; MEASURE_RETRANS_PER_GIB=$DIRECTION_RETRANS_PER_GIB
+  MEASURE_TRANSFER_MIB=$DIRECTION_TRANSFER_MIB; MEASURE_RATE_SPREAD=$DIRECTION_RATE_SPREAD
+  if (( BIDIRECTIONAL )); then
+    if ! measure_direction reverse '入站'; then return 1; fi
+    MEASURE_REVERSE_RATE=$DIRECTION_RATE; MEASURE_REVERSE_RETRANS_PER_GIB=$DIRECTION_RETRANS_PER_GIB
+    MEASURE_REVERSE_TRANSFER_MIB=$DIRECTION_TRANSFER_MIB; MEASURE_REVERSE_RATE_SPREAD=$DIRECTION_RATE_SPREAD
+  fi
   measure_rtt
+  combined_mib=$(( MEASURE_TRANSFER_MIB + ${MEASURE_REVERSE_TRANSFER_MIB:-0} ))
   line
-  say "有效轮次：$valid/$ROUNDS；中位吞吐：${MEASURE_RATE} Mbit/s。"
-  say "有效轮次累计发送端重传：${MEASURE_RETRANS}；估算测试流量约 ${estimated_mb} MB。"
+  say "出站：${MEASURE_RATE} Mbit/s；重传 ${MEASURE_RETRANS_PER_GIB} 次/GiB；波动 ${MEASURE_RATE_SPREAD}%。"
+  if (( BIDIRECTIONAL )); then say "入站：${MEASURE_REVERSE_RATE} Mbit/s；重传 ${MEASURE_REVERSE_RETRANS_PER_GIB} 次/GiB；波动 ${MEASURE_REVERSE_RATE_SPREAD}%。"; fi
+  say "本阶段实际传输约 ${combined_mib} MiB。"
   say "ping 平均 RTT：${MEASURE_RTT:-未取得} ms。"
   line
 }
@@ -398,7 +455,9 @@ build_settings() {
   local buffer initial_rmem initial_wmem backlog socket_queue syn_queue
   KEYS=(); VALUES=()
   buffer=$(calculate_buffer); initial_rmem=$(calculate_initial_rmem "$buffer"); initial_wmem=$(calculate_initial_wmem "$buffer"); backlog=$(calculate_backlog); case "$ROLE" in proxy|server) socket_queue=8192; syn_queue=8192 ;; *) socket_queue=4096; syn_queue=4096 ;; esac
-  add_setting net.core.default_qdisc fq; add_setting net.ipv4.tcp_congestion_control bbr
+  # default_qdisc 只影响以后新建/重建的队列，当前活动根 qdisc 不会随 sysctl 立即变化。
+  # 为保证调优前后测试的是同一队列，本工具不再在基础调优中改它；整形是独立显式操作。
+  add_setting net.ipv4.tcp_congestion_control bbr
   add_setting net.core.rmem_max "$buffer"; add_setting net.core.wmem_max "$buffer"
   add_setting net.ipv4.tcp_rmem "4096 $initial_rmem $buffer"; add_setting net.ipv4.tcp_wmem "4096 $initial_wmem $buffer"
   add_setting net.ipv4.tcp_mtu_probing 1; add_setting net.ipv4.tcp_slow_start_after_idle 0; add_setting net.ipv4.tcp_moderate_rcvbuf 1
@@ -427,7 +486,7 @@ show_plan() {
   local i buffer initial_rmem initial_wmem; buffer=$(calculate_buffer); initial_rmem=$(calculate_initial_rmem "$buffer"); initial_wmem=$(calculate_initial_wmem "$buffer"); show_environment
   say "用途=$ROLE；带宽=${BANDWIDTH_MBIT} Mbit/s；业务目标 RTT=${RTT_MS} ms；推导缓冲区上限=${buffer} 字节；初始接收/发送缓冲区=${initial_rmem}/${initial_wmem} 字节。"
   for i in "${!KEYS[@]}"; do say "${KEYS[$i]}：$(sysctl_value "${KEYS[$i]}") -> ${VALUES[$i]}"; done
-  say '默认 qdisc 不会替换现有活动根队列；只有明确执行 shape 时才会改动它。'
+  say '基础调优保留默认及活动 qdisc，确保前后复测队列一致；只有明确执行 shape 时才会改动活动队列。'
 }
 
 snapshot_if_needed() {
@@ -478,14 +537,15 @@ write_facts() {
   local tmp
   tmp=$(mktemp "$STATE_DIR/facts.XXXXXX") || return 1
   chmod 600 "$tmp" || { rm -f "$tmp"; return 1; }
-  if ! { printf 'role\t%s\n' "$ROLE"; printf 'bandwidth_mbit\t%s\n' "$BANDWIDTH_MBIT"; printf 'target_rtt_ms\t%s\n' "$RTT_MS"; printf 'test_peer_rtt_ms\t%s\n' "${MEASURE_RTT:-}"; printf 'buffer_bdp_multiplier\t%s\n' "${BUFFER_MULTIPLIER_OVERRIDE:-default}"; printf 'tcp_initial_rmem\t%s\n' "$(calculate_initial_rmem "$(calculate_buffer)")"; printf 'tcp_initial_wmem\t%s\n' "$(calculate_initial_wmem "$(calculate_buffer)")"; printf 'peer\t%s\n' "$PEER"; printf 'measured_mbit\t%s\n' "${MEASURE_RATE:-}"; printf 'measured_retrans\t%s\n' "${MEASURE_RETRANS:-}"; printf 'facts_end\t1\n'; } >"$tmp"; then
+  if ! { printf 'role\t%s\n' "$ROLE"; printf 'bandwidth_mbit\t%s\n' "$BANDWIDTH_MBIT"; printf 'target_rtt_ms\t%s\n' "$RTT_MS"; printf 'test_peer_rtt_ms\t%s\n' "${MEASURE_RTT:-}"; printf 'buffer_bdp_multiplier\t%s\n' "${BUFFER_MULTIPLIER_OVERRIDE:-default}"; printf 'tcp_initial_rmem\t%s\n' "$(calculate_initial_rmem "$(calculate_buffer)")"; printf 'tcp_initial_wmem\t%s\n' "$(calculate_initial_wmem "$(calculate_buffer)")"; printf 'peer\t%s\n' "$PEER"; printf 'measured_egress_mbit\t%s\n' "${MEASURE_RATE:-}"; printf 'measured_egress_retrans_per_gib\t%s\n' "${MEASURE_RETRANS_PER_GIB:-}"; printf 'measured_egress_spread_percent\t%s\n' "${MEASURE_RATE_SPREAD:-}"; printf 'measured_ingress_mbit\t%s\n' "${MEASURE_REVERSE_RATE:-}"; printf 'measured_ingress_retrans_per_gib\t%s\n' "${MEASURE_REVERSE_RETRANS_PER_GIB:-}"; printf 'measured_ingress_spread_percent\t%s\n' "${MEASURE_REVERSE_RATE_SPREAD:-}"; printf 'facts_end\t1\n'; } >"$tmp"; then
     rm -f "$tmp"; return 1
   fi
   tail -n 1 "$tmp" | grep -Fqx $'facts_end\t1' || { rm -f "$tmp"; return 1; }
   mv -f "$tmp" "$FACTS_FILE"
 }
 write_experiment_report() {
-  local baseline_rate=$1 baseline_retrans=$2 after_rate=$3 after_retrans=$4 decision=$5 report_file
+  local baseline_rate=$1 baseline_retrans_per_gib=$2 after_rate=$3 after_retrans_per_gib=$4 decision=$5
+  local baseline_reverse_rate=${6:-} baseline_reverse_retrans_per_gib=${7:-} after_reverse_rate=${8:-} after_reverse_retrans_per_gib=${9:-} report_file
   install -d -m 700 "$REPORT_DIR"
   report_file="$REPORT_DIR/experiment-$(date -u '+%Y%m%dT%H%M%SZ').tsv"
   {
@@ -499,10 +559,14 @@ write_experiment_report() {
     printf 'target_rtt_ms\t%s\n' "$RTT_MS"
     printf 'test_peer_rtt_ms\t%s\n' "${MEASURE_RTT:-}"
     printf 'buffer_bdp_multiplier\t%s\n' "${BUFFER_MULTIPLIER_OVERRIDE:-default}"
-    printf 'baseline_mbit\t%s\n' "$baseline_rate"
-    printf 'baseline_retrans\t%s\n' "$baseline_retrans"
-    printf 'after_mbit\t%s\n' "$after_rate"
-    printf 'after_retrans\t%s\n' "$after_retrans"
+    printf 'baseline_egress_mbit\t%s\n' "$baseline_rate"
+    printf 'baseline_egress_retrans_per_gib\t%s\n' "$baseline_retrans_per_gib"
+    printf 'after_egress_mbit\t%s\n' "$after_rate"
+    printf 'after_egress_retrans_per_gib\t%s\n' "$after_retrans_per_gib"
+    printf 'baseline_ingress_mbit\t%s\n' "$baseline_reverse_rate"
+    printf 'baseline_ingress_retrans_per_gib\t%s\n' "$baseline_reverse_retrans_per_gib"
+    printf 'after_ingress_mbit\t%s\n' "$after_reverse_rate"
+    printf 'after_ingress_retrans_per_gib\t%s\n' "$after_reverse_retrans_per_gib"
     if [[ $after_rate =~ ^[0-9]+$ ]]; then
       awk -v before="$baseline_rate" -v after="$after_rate" 'BEGIN {if (before > 0) printf "gain_percent\t%.2f\n", (after-before)*100/before}'
     fi
@@ -511,12 +575,20 @@ write_experiment_report() {
   say "实验报告：$report_file"
 }
 is_material_regression() {
-  local baseline_rate=$1 baseline_retrans=$2 after_rate=$3 after_retrans=$4
-  (( after_rate * 100 < baseline_rate * 85 )) && return 0
-  (( baseline_retrans == 0 && after_retrans > 10 )) && return 0
-  (( baseline_retrans > 0 && after_retrans > baseline_retrans * 2 + 10 )) && return 0
+  local baseline_rate=$1 baseline_retrans_per_gib=$2 after_rate=$3 after_retrans_per_gib=$4 label=${5:-链路} allowed_retrans
+  REGRESSION_REASON=''
+  if (( after_rate * 100 < baseline_rate * 85 )); then
+    REGRESSION_REASON="${label}吞吐从 ${baseline_rate} 降至 ${after_rate} Mbit/s，下降超过 15%"
+    return 0
+  fi
+  allowed_retrans=$(( baseline_retrans_per_gib * RETRANS_RELATIVE_MULTIPLIER + RETRANS_PER_GIB_MARGIN ))
+  if (( after_retrans_per_gib > RETRANS_PER_GIB_HARD_LIMIT && after_retrans_per_gib > allowed_retrans )); then
+    REGRESSION_REASON="${label}重传从 ${baseline_retrans_per_gib} 增至 ${after_retrans_per_gib} 次/GiB（容许上限 ${allowed_retrans}）"
+    return 0
+  fi
   return 1
 }
+REGRESSION_REASON=''
 revert_auto_experiment() {
   warn '复测失败或出现明显退化，正在恢复本次应用前的 TCP 参数。'
   if abort_transaction; then
@@ -557,6 +629,13 @@ restore_legacy_core_defaults() {
     sysctl -q -w "$key=$saved" || return 1
     say "已恢复不再管理的 $key。"
   done
+  if grep -Fqx 'net.core.default_qdisc = fq' "$CONFIG_FILE" && [[ $(sysctl_value net.core.default_qdisc) == fq ]]; then
+    saved=$(awk -F'\t' '$1 == "net.core.default_qdisc" { print $2; exit }' "$SNAPSHOT_FILE")
+    if [[ -n $saved ]]; then
+      sysctl -q -w "net.core.default_qdisc=$saved" || return 1
+      say "已恢复旧版曾修改但未参与活动队列复测的 net.core.default_qdisc=$saved。"
+    fi
+  fi
 }
 apply_built_settings() {
   local index
@@ -593,9 +672,11 @@ apply_tuning() {
   fi
 }
 search_buffer_candidates() {
-  local saved_override=$BUFFER_MULTIPLIER_OVERRIDE saved_rounds=$ROUNDS candidate candidate_rate candidate_retrans best_multiplier='' best_rate=0 best_retrans=0
+  local saved_override=$BUFFER_MULTIPLIER_OVERRIDE saved_rounds=$ROUNDS candidate candidate_rate candidate_retrans candidate_reverse_retrans
+  local best_multiplier='' best_rate=0 best_retrans=0 best_reverse_retrans=0 search_tests=6
   local -a candidates=(1 2 3)
-  guard_test_traffic 'BDP 缓冲区搜索' "$BANDWIDTH_MBIT" 6 || { warn '已跳过高流量缓冲区搜索，保留默认 2× BDP 候选。'; return 0; }
+  (( BIDIRECTIONAL )) && search_tests=12
+  guard_test_traffic 'BDP 缓冲区搜索' "$BANDWIDTH_MBIT" "$search_tests" || { warn '已跳过高流量缓冲区搜索，保留默认 2× BDP 候选。'; return 0; }
   say '开始 BDP 缓冲区 A/B 搜索：分别测试 1×、2×、3× BDP 上限。'
   say '每个候选使用两轮测试；仅保留吞吐最高且重传不明显恶化的候选。'
   ROUNDS=2
@@ -610,10 +691,10 @@ search_buffer_candidates() {
       warn "${candidate}× BDP 的测量不足，已跳过该候选。"
       continue
     fi
-    candidate_rate=$MEASURE_RATE; candidate_retrans=$MEASURE_RETRANS
-    say "${candidate}× BDP：中位吞吐 ${candidate_rate}Mbit，累计重传 ${candidate_retrans}。"
-    if (( candidate_retrans <= 10 && candidate_rate > best_rate )); then
-      best_multiplier=$candidate; best_rate=$candidate_rate; best_retrans=$candidate_retrans
+    candidate_rate=$MEASURE_RATE; candidate_retrans=$MEASURE_RETRANS_PER_GIB; candidate_reverse_retrans=${MEASURE_REVERSE_RETRANS_PER_GIB:-0}
+    say "${candidate}× BDP：出站 ${candidate_rate}Mbit，重传 ${candidate_retrans} 次/GiB；入站重传 ${candidate_reverse_retrans} 次/GiB。"
+    if (( candidate_retrans <= RETRANS_PER_GIB_HARD_LIMIT && candidate_reverse_retrans <= RETRANS_PER_GIB_HARD_LIMIT && candidate_rate > best_rate )); then
+      best_multiplier=$candidate; best_rate=$candidate_rate; best_retrans=$candidate_retrans; best_reverse_retrans=$candidate_reverse_retrans
     fi
   done
   ROUNDS=$saved_rounds
@@ -627,7 +708,7 @@ search_buffer_candidates() {
   BUFFER_MULTIPLIER_OVERRIDE=$best_multiplier
   build_settings
   apply_built_settings || { abort_transaction || fail '最佳缓冲区候选应用失败，且部分参数未能恢复；事务快照已保留。'; fail '最佳缓冲区候选应用失败，已恢复本次应用前参数。'; }
-  say "已选择 ${best_multiplier}× BDP 缓冲区：${best_rate}Mbit，累计重传 ${best_retrans}。"
+  say "已选择 ${best_multiplier}× BDP 缓冲区：${best_rate}Mbit，出站/入站重传 ${best_retrans}/${best_reverse_retrans} 次/GiB。"
 }
 
 qdisc_leaf_is_restorable() { case "$1" in fq|fq_codel|pfifo_fast|pfifo|bfifo) return 0 ;; *) return 1 ;; esac; }
@@ -802,24 +883,25 @@ unshape() {
   remove_qdisc_snapshot "$original_spec"; rm -f "$SHAPE_STATE"; ok '已移除本工具整形并恢复根 qdisc 参数。'
 }
 policer_candidate_is_clean() {
-  local rate=$1 retrans=$2 target_rate=$3 baseline_retrans=$4 allowed_retrans
-  allowed_retrans=$(( baseline_retrans / 4 + 10 ))
-  (( retrans <= allowed_retrans && rate * 100 >= target_rate * 90 ))
+  local rate=$1 retrans_per_gib=$2 target_rate=$3 baseline_retrans_per_gib=$4 allowed_retrans
+  allowed_retrans=$(( baseline_retrans_per_gib * 2 + RETRANS_PER_GIB_MARGIN ))
+  (( allowed_retrans < RETRANS_PER_GIB_HARD_LIMIT )) && allowed_retrans=$RETRANS_PER_GIB_HARD_LIMIT
+  (( retrans_per_gib <= allowed_retrans && rate * 100 >= target_rate * 90 ))
 }
 probe_shaper_candidate() {
-  local iface=$1 original=$2 original_spec=$3 candidate_rate=$4 baseline_retrans=$5
+  local iface=$1 original=$2 original_spec=$3 candidate_rate=$4 baseline_retrans_per_gib=$5
   apply_shape "$iface" "$candidate_rate" || return 2
   if ! measure; then
     restore_root_qdisc "$iface" "$original" "$original_spec" || return 2
     return 2
   fi
   restore_root_qdisc "$iface" "$original" "$original_spec" || return 2
-  say "扫描 ${candidate_rate}Mbit：中位吞吐 ${MEASURE_RATE}Mbit，累计重传 ${MEASURE_RETRANS}。"
-  policer_candidate_is_clean "$MEASURE_RATE" "$MEASURE_RETRANS" "$candidate_rate" "$baseline_retrans"
+  say "扫描 ${candidate_rate}Mbit：中位吞吐 ${MEASURE_RATE}Mbit，重传 ${MEASURE_RETRANS_PER_GIB} 次/GiB。"
+  policer_candidate_is_clean "$MEASURE_RATE" "$MEASURE_RETRANS_PER_GIB" "$candidate_rate" "$baseline_retrans_per_gib"
 }
 scan_shaper_candidate() {
   validate_peer; ensure_iperf3; require_command tc
-  local nominal candidate best='' last_clean='' broke_at='' iface original original_spec snapshot saved_rounds baseline_retrans qdisc_backup probe_status safe_rate
+  local nominal candidate best='' last_clean='' broke_at='' iface original original_spec snapshot saved_rounds saved_bidirectional baseline_retrans_per_gib qdisc_backup probe_status safe_rate
   local -a coarse=(85 92 99 106 114 123 133 145)
   iface=$(default_interface); [[ -n $iface ]] || fail '未检测到默认出口网卡。'
   validate_iface "$iface"
@@ -827,19 +909,19 @@ scan_shaper_candidate() {
   snapshot=$(qdisc_snapshot "$iface" "$qdisc_backup") || { rm -f -- "$qdisc_backup"; fail '当前根 qdisc 无法精确重建，拒绝扫描整形。'; }
   IFS=$'\t' read -r original original_spec <<<"$snapshot"
   [[ $original == mq ]] || rm -f -- "$qdisc_backup"
-  nominal=$BANDWIDTH_MBIT
+  nominal=${MEASURE_RATE:-$BANDWIDTH_MBIT}
   guard_test_traffic '限速器拐点扫描（最坏情况）' "$nominal" "$(( POLICER_ROUNDS * 16 ))" || { warn '已跳过高流量限速器扫描；基础 TCP 调优不受影响。'; remove_qdisc_snapshot "$qdisc_backup"; return 0; }
-  baseline_retrans=${MEASURE_RETRANS:-0}
+  baseline_retrans_per_gib=${MEASURE_RETRANS_PER_GIB:-0}
   say "开始限速器拐点扫描：以 ${nominal}Mbit 基线从 85% 到 145% 自适应粗扫。"
   say "每个候选使用 ${POLICER_ROUNDS} 轮测试；判定会同时参考基线重传噪声和送达率。"
   say '发现拐点后使用二分法精扫；每轮临时 HTB+FQ 后都会恢复原 qdisc。'
   confirm "扫描会暂时替换 $iface 的根 qdisc，预计消耗较多流量。继续吗？" || { remove_qdisc_snapshot "$qdisc_backup"; say '已跳过扫描。'; return 0; }
-  saved_rounds=$ROUNDS; ROUNDS=$POLICER_ROUNDS
-  trap 'restore_root_qdisc "$iface" "$original" "$original_spec" >/dev/null 2>&1 || true; remove_qdisc_snapshot "$qdisc_backup"; ROUNDS=$saved_rounds' EXIT
+  saved_rounds=$ROUNDS; saved_bidirectional=$BIDIRECTIONAL; ROUNDS=$POLICER_ROUNDS; BIDIRECTIONAL=0
+  trap 'restore_root_qdisc "$iface" "$original" "$original_spec" >/dev/null 2>&1 || true; remove_qdisc_snapshot "$qdisc_backup"; ROUNDS=$saved_rounds; BIDIRECTIONAL=$saved_bidirectional' EXIT
   trap 'exit 130' INT TERM HUP
   for candidate in "${coarse[@]}"; do
     SHAPE_RATE=$(( nominal * candidate / 100 ))
-    if probe_shaper_candidate "$iface" "$original" "$original_spec" "$SHAPE_RATE" "$baseline_retrans"; then
+    if probe_shaper_candidate "$iface" "$original" "$original_spec" "$SHAPE_RATE" "$baseline_retrans_per_gib"; then
       last_clean=$SHAPE_RATE; best=$SHAPE_RATE
     else
       probe_status=$?
@@ -852,7 +934,7 @@ scan_shaper_candidate() {
     say "拐点区间：${last_clean} 到 ${broke_at} Mbit，开始二分精扫。"
     while (( broke_at - last_clean > 1 )); do
       candidate=$(( (last_clean + broke_at) / 2 ))
-      if probe_shaper_candidate "$iface" "$original" "$original_spec" "$candidate" "$baseline_retrans"; then
+      if probe_shaper_candidate "$iface" "$original" "$original_spec" "$candidate" "$baseline_retrans_per_gib"; then
         last_clean=$candidate; best=$candidate
       else
         probe_status=$?
@@ -861,7 +943,7 @@ scan_shaper_candidate() {
       fi
     done
   fi
-  ROUNDS=$saved_rounds
+  ROUNDS=$saved_rounds; BIDIRECTIONAL=$saved_bidirectional
   restore_root_qdisc "$iface" "$original" "$original_spec" || fail '扫描结束时恢复根 qdisc 参数失败，请立即检查网络状态。'
   trap - EXIT INT TERM HUP
   remove_qdisc_snapshot "$qdisc_backup"
@@ -874,19 +956,22 @@ scan_shaper_candidate() {
   fi
 }
 auto() {
-  local baseline_rate baseline_retrans after_rate after_retrans decision
+  local baseline_rate baseline_retrans_per_gib baseline_reverse_rate baseline_reverse_retrans_per_gib
+  local after_rate after_retrans_per_gib after_reverse_rate after_reverse_retrans_per_gib decision regressed=0 regression_reasons=''
   require_root; require_linux; validate_common
   say '阶段 1/3：记录调优前基线。'
   if ! measure; then
     fail '调优前基线不足，未改动系统。请稍后重试或指定可信 iperf3 对端。'
   fi
-  baseline_rate=$MEASURE_RATE; baseline_retrans=$MEASURE_RETRANS
-  BANDWIDTH_MBIT=$MEASURE_RATE
+  baseline_rate=$MEASURE_RATE; baseline_retrans_per_gib=$MEASURE_RETRANS_PER_GIB
+  baseline_reverse_rate=${MEASURE_REVERSE_RATE:-}; baseline_reverse_retrans_per_gib=${MEASURE_REVERSE_RETRANS_PER_GIB:-}
+  BANDWIDTH_MBIT=$baseline_rate
+  if (( BIDIRECTIONAL )) && (( baseline_reverse_rate > BANDWIDTH_MBIT )); then BANDWIDTH_MBIT=$baseline_reverse_rate; fi
   if [[ -z $RTT_MS ]]; then
     RTT_MS=$AUTO_TARGET_RTT_MS
-    say "测速对端 RTT 为 ${MEASURE_RTT:-未取得}ms，仅用于测量质量；BDP 按跨境业务默认目标 RTT ${RTT_MS}ms 推导。"
+    say "测速对端 RTT 为 ${MEASURE_RTT:-未取得}ms，仅用于测量质量；BDP 按出站/入站较大吞吐 ${BANDWIDTH_MBIT}Mbit/s 与跨境业务默认目标 RTT ${RTT_MS}ms 推导。"
   else
-    say "BDP 使用你指定的业务目标 RTT ${RTT_MS}ms；测速对端 RTT 为 ${MEASURE_RTT:-未取得}ms。"
+    say "BDP 使用出站/入站较大吞吐 ${BANDWIDTH_MBIT}Mbit/s 与你指定的业务目标 RTT ${RTT_MS}ms；测速对端 RTT 为 ${MEASURE_RTT:-未取得}ms。"
   fi
   derive_network_facts
   say '阶段 2/3：应用按基线推导的候选配置。'
@@ -901,14 +986,20 @@ auto() {
   say '阶段 3/3：使用同一对端、同一轮次复测。'
   if ! measure; then
     decision='rolled_back_unverified'
-    write_experiment_report "$baseline_rate" "$baseline_retrans" '' '' "$decision"
+    write_experiment_report "$baseline_rate" "$baseline_retrans_per_gib" '' '' "$decision" "$baseline_reverse_rate" "$baseline_reverse_retrans_per_gib" '' ''
     warn "复测不足，候选参数不予保留。最后一次 iperf3 错误：${MEASURE_FAILURE:-未取得}"
     revert_auto_experiment
     return 0
   fi
-  after_rate=$MEASURE_RATE; after_retrans=$MEASURE_RETRANS
+  after_rate=$MEASURE_RATE; after_retrans_per_gib=$MEASURE_RETRANS_PER_GIB
+  after_reverse_rate=${MEASURE_REVERSE_RATE:-}; after_reverse_retrans_per_gib=${MEASURE_REVERSE_RETRANS_PER_GIB:-}
   decision='retained'
-  if is_material_regression "$baseline_rate" "$baseline_retrans" "$after_rate" "$after_retrans"; then
+  if is_material_regression "$baseline_rate" "$baseline_retrans_per_gib" "$after_rate" "$after_retrans_per_gib" '出站'; then regressed=1; regression_reasons=$REGRESSION_REASON; fi
+  if (( BIDIRECTIONAL )) && is_material_regression "$baseline_reverse_rate" "$baseline_reverse_retrans_per_gib" "$after_reverse_rate" "$after_reverse_retrans_per_gib" '入站'; then
+    regressed=1; regression_reasons+="${regression_reasons:+；}$REGRESSION_REASON"
+  fi
+  if (( regressed )); then
+    warn "候选配置未通过：$regression_reasons。"
     if (( KEEP_ON_REGRESSION )); then
       decision='retained_by_override'
       warn '复测出现明显退化，但你指定了 --keep-on-regression，配置将保留。'
@@ -916,7 +1007,7 @@ auto() {
       decision='rolled_back_regression'
     fi
   fi
-  write_experiment_report "$baseline_rate" "$baseline_retrans" "$after_rate" "$after_retrans" "$decision"
+  write_experiment_report "$baseline_rate" "$baseline_retrans_per_gib" "$after_rate" "$after_retrans_per_gib" "$decision" "$baseline_reverse_rate" "$baseline_reverse_retrans_per_gib" "$after_reverse_rate" "$after_reverse_retrans_per_gib"
   if [[ $decision == rolled_back_regression ]]; then
     revert_auto_experiment
     return 0
@@ -929,7 +1020,7 @@ auto() {
   discard_transaction
   ok '复测未出现明显退化，已保留候选 TCP 配置。'
   if (( ENABLE_SHAPING )); then
-    if [[ $MEASURE_RETRANS == 0 ]]; then say '验证无重传，跳过限速器扫描。';
+    if [[ $MEASURE_RETRANS_PER_GIB == 0 ]]; then say '验证无重传，跳过限速器扫描。';
     else warn '已启用限速器候选扫描。扫描只给出建议，不会持久化整形。'; scan_shaper_candidate; fi
   fi
 }
@@ -975,8 +1066,8 @@ EOF
 }
 parse_options() {
   while (($#)); do case "$1" in
-    --peer) PEER=${2:-}; shift 2 ;; --port) PEER_PORT=${2:-}; shift 2 ;; --role) ROLE=${2:-}; shift 2 ;; --bandwidth) BANDWIDTH_MBIT=${2:-}; shift 2 ;; --rtt) RTT_MS=${2:-}; shift 2 ;; --duration) DURATION=${2:-}; shift 2 ;; --workers) WORKERS=${2:-}; shift 2 ;; --rounds) ROUNDS=${2:-}; shift 2 ;; --policer-rounds) POLICER_ROUNDS=${2:-}; shift 2 ;; --peer-max-rtt) PEER_MAX_RTT=${2:-}; shift 2 ;; --max-test-gib) MAX_TEST_GIB=${2:-}; shift 2 ;; --shape-rate) SHAPE_RATE=${2:-}; shift 2 ;;
-    --enable-shaping) ENABLE_SHAPING=1; shift ;; --search-buffers) BUFFER_SEARCH=1; shift ;; --allow-public-peers) ALLOW_PUBLIC_PEERS=1; shift ;; --allow-high-traffic) ALLOW_HIGH_TRAFFIC=1; shift ;; --dry-run) DRY_RUN=1; shift ;; --yes) ASSUME_YES=1; shift ;; --no-install) NO_INSTALL=1; shift ;; --keep-on-regression) KEEP_ON_REGRESSION=1; shift ;; -h|--help) usage; exit 0 ;; *) fail "未知选项：$1" ;;
+    --peer) PEER=${2:-}; shift 2 ;; --port) PEER_PORT=${2:-}; shift 2 ;; --role) ROLE=${2:-}; shift 2 ;; --bandwidth) BANDWIDTH_MBIT=${2:-}; shift 2 ;; --rtt) RTT_MS=${2:-}; shift 2 ;; --duration) DURATION=${2:-}; shift 2 ;; --workers) WORKERS=${2:-}; shift 2 ;; --rounds) ROUNDS=${2:-}; shift 2 ;; --policer-rounds) POLICER_ROUNDS=${2:-}; shift 2 ;; --peer-max-rtt) PEER_MAX_RTT=${2:-}; shift 2 ;; --max-test-gib) MAX_TEST_GIB=${2:-}; shift 2 ;; --max-rate-spread) MAX_RATE_SPREAD_PERCENT=${2:-}; shift 2 ;; --shape-rate) SHAPE_RATE=${2:-}; shift 2 ;;
+    --enable-shaping) ENABLE_SHAPING=1; shift ;; --search-buffers) BUFFER_SEARCH=1; shift ;; --allow-public-peers) ALLOW_PUBLIC_PEERS=1; shift ;; --allow-high-traffic) ALLOW_HIGH_TRAFFIC=1; shift ;; --forward-only) BIDIRECTIONAL=0; shift ;; --dry-run) DRY_RUN=1; shift ;; --yes) ASSUME_YES=1; shift ;; --no-install) NO_INSTALL=1; shift ;; --keep-on-regression) KEEP_ON_REGRESSION=1; shift ;; -h|--help) usage; exit 0 ;; *) fail "未知选项：$1" ;;
   esac; done
 }
 main() {

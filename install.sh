@@ -2,9 +2,9 @@
 # 安全安装器：下载固定 Release 资产或读取显式本地文件，并用内置 SHA-256 校验后安装。
 set -Eeuo pipefail
 
-readonly VERSION='4.0.0'
+readonly VERSION='4.1.0'
 readonly REPOSITORY='elonjack/vps-tcp-safe-tuner'
-readonly EXPECTED_SHA256='84fdaddc0db65c6a3cb0e0d8c5626e4cf8fbde2cdf407b344477c9c583f3fa59'
+readonly EXPECTED_SHA256='e3facde271c53460d3e6445f2c76256298cf0c026afc99f9e4b9196361d10ee7'
 readonly DOWNLOAD_URL="https://github.com/$REPOSITORY/releases/download/v$VERSION/vps-tcp-tune.sh"
 readonly INSTALL_PATH='/usr/local/bin/vps-tcp-tune'
 

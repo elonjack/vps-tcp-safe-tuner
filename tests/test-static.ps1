@@ -22,7 +22,10 @@ if ($content -notmatch 'calculate_initial_rmem') { throw 'Missing role-aware TCP
 if ($content -notmatch 'calculate_initial_wmem') { throw 'Missing role-aware TCP send buffer calculation.' }
 if ($content -match 'add_setting net\.core\.(rmem_default|wmem_default)') { throw 'TCP defaults must not alter global socket defaults.' }
 if ($content -notmatch 'restore_legacy_core_defaults') { throw 'Missing v3.6.0 global default migration.' }
-if ($content -notmatch 'baseline_retrans \* 2 \+ 10') { throw 'Missing relative retransmission rollback guard.' }
+if ($content -notmatch 'RETRANS_PER_GIB_HARD_LIMIT') { throw 'Missing transfer-normalized retransmission guard.' }
+if ($content -notmatch 'MAX_RATE_SPREAD_PERCENT') { throw 'Missing multi-round stability guard.' }
+if ($content -notmatch 'command\+=\(-R\)') { throw 'Missing iperf3 reverse-direction measurement.' }
+if ($content -match 'add_setting net\.core\.default_qdisc fq') { throw 'Do not persist an untested qdisc during base tuning.' }
 if ($content -notmatch 'transaction\.tsv') { throw 'Missing per-run transaction snapshot.' }
 if ($content -notmatch 'restore_transaction_values') { throw 'Missing per-run transaction restore.' }
 if ($content -notmatch 'run_measure_iperf') { throw 'Missing same-peer iperf3 port fallback.' }
@@ -34,7 +37,7 @@ if ($content -notmatch 'SHAPE_SCRIPT_MARKER') { throw 'Persistent shaping script
 if ($content -notmatch 'SHAPE_UNIT_MARKER') { throw 'Persistent shaping unit needs an ownership marker.' }
 if ($content -notmatch 'validate_iface') { throw 'Interface names must be validated before persistence.' }
 if ($content -notmatch '部分 sysctl 恢复失败；配置和快照均已保留') { throw 'Rollback must retain evidence after partial restore failure.' }
-if ($installContent -notmatch "readonly VERSION='4\.0\.0'") { throw 'Installer version is stale.' }
+if ($installContent -notmatch "readonly VERSION='4\.1\.0'") { throw 'Installer version is stale.' }
 if ($installContent -match "EXPECTED_SHA256='TO_BE_REPLACED'") { throw 'Installer checksum placeholder was not replaced.' }
 if ($installContent -notmatch '--local') { throw 'Installer needs an offline/local verified path.' }
 $expectedMatch = [regex]::Match($installContent, "EXPECTED_SHA256='([0-9a-f]{64})'")

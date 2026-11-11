@@ -11,7 +11,7 @@
 SSH 登录 VPS 后，复制下面两行执行：
 
 ```bash
-curl -fLO https://github.com/elonjack/vps-tcp-safe-tuner/releases/download/v4.0.0/install.sh
+curl -fLO https://github.com/elonjack/vps-tcp-safe-tuner/releases/download/v4.1.0/install.sh
 bash install.sh
 ```
 
@@ -103,6 +103,9 @@ sudo vps-tcp-tune apply --bandwidth 1000 --rtt 150 --role proxy --dry-run
 
 - 只支持 Linux VPS，需要 root 或 `sudo`。
 - 自动模式会产生真实测速流量。单个阶段默认最多估算 20 GiB，超过会停止。
+- 默认分别测试 VPS 出站和入站，并按实际传输量计算“每 GiB 重传次数”。
+- 三轮吞吐波动超过 40% 时会判定公共节点不稳定，在修改系统之前停止。
+- 流量有限时可在高级命令末尾加 `--forward-only`，只测 VPS 出站；判断会少一个方向的证据。
 - `--allow-public-peers` 表示允许连接内置第三方 iperf3 节点；对端会看到 VPS 的公网 IP。
 - 脚本不会修改防火墙、SSH、路由、swap，也不会下载新内核。
 - 默认不会替换当前活动 qdisc；只有明确执行整形命令才会修改。
@@ -179,6 +182,7 @@ sudo vps-tcp-tune unshape
 - 持久化文件使用原子写入和所有权标记，不覆盖同名第三方文件。
 - 写入 systemd 脚本前严格校验网卡名，整形服务限制文件系统权限和 capability。
 - 调优后使用同一对端复测；明显退化或无法完成验证时默认恢复。
+- 基础调优保持当前 qdisc 不变，保证调优前后使用同一队列进行 A/B 对比。
 - 安装器固定 Release 版本并使用内置 SHA-256 校验主脚本。
 
 对参考项目 tcpfit v0.5.9 的静态安全审阅见 [SECURITY-REVIEW-tcpfit.md](SECURITY-REVIEW-tcpfit.md)。
