@@ -847,14 +847,14 @@ active_qdisc_is_fq() {
   ' <<<"$output"
 }
 apply_fq_candidate() {
-  local iface=$1 original_kind=$2 snapshot_file=$3 kind parent ignored_spec minor found=0
+  local iface=$1 original_kind=$2 snapshot_file=$3 kind parent minor found=0
   if [[ $original_kind != mq ]]; then
     tc qdisc replace dev "$iface" root fq
     return
   fi
   [[ -f $snapshot_file ]] || return 1
   tc qdisc replace dev "$iface" root handle 1: mq || return 1
-  while IFS=$'\t' read -r kind parent ignored_spec; do
+  while IFS=$'\t' read -r kind parent _; do
     qdisc_leaf_is_restorable "$kind" || return 1
     [[ $parent =~ ^(:|[0-9]+:)[1-9][0-9]*$ ]] || return 1
     minor=${parent##*:}
