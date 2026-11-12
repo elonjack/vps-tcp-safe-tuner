@@ -38,12 +38,17 @@ assert_equals 1 "$QDISC_EXPERIMENT" '活动 qdisc 实验参数解析'
 export PEER_MAX_RTT=120 MAX_TEST_GIB=20 MAX_RATE_SPREAD_PERCENT=40 ALLOW_PUBLIC_PEERS=0 ALLOW_HIGH_TRAFFIC=0 BIDIRECTIONAL=1 QDISC_EXPERIMENT=0
 
 export BANDWIDTH_MBIT=284
+memory_mib() { printf 2048; }
 export RTT_MS=150
 export ROLE=general
 export BUFFER_MULTIPLIER_OVERRIDE=''
-assert_equals 10650000 "$(calculate_buffer)" '跨境 150ms BDP 缓冲区推导'
+assert_equals 12747152 "$(calculate_buffer)" '跨境 150ms BDP 缓冲区推导及余量'
 export ROLE=proxy
-assert_equals 10650000 "$(calculate_buffer)" '代理采用保守的 2× BDP 上限'
+assert_equals 12747152 "$(calculate_buffer)" '代理采用 2× BDP + 2MiB 上限'
+assert_equals 67108864 "$(BANDWIDTH_MBIT=3000 RTT_MS=150 calculate_buffer)" '2GiB 内存单 socket 上限'
+getconf() { printf 65536; }
+assert_equals '2048 4096 8192' "$(calculate_tcp_mem)" '64KiB 页大小的 TCP 内存预算'
+unset -f getconf
 assert_equals 1048576 "$(calculate_initial_rmem "$(calculate_buffer)")" '代理初始接收缓冲区'
 assert_equals 262144 "$(calculate_initial_wmem "$(calculate_buffer)")" '代理初始发送缓冲区'
 export ROLE=general

@@ -6,7 +6,7 @@ set -Eeuo pipefail
 IFS=$'\n\t'
 umask 077
 
-readonly VERSION='6.0.1'
+readonly VERSION='6.1.0'
 readonly STATE_DIR='/var/lib/vps-tcp-safe-tuner'
 readonly SNAPSHOT_FILE="$STATE_DIR/baseline.tsv"
 readonly TRANSACTION_FILE="$STATE_DIR/transaction.tsv"
@@ -17,6 +17,11 @@ readonly SHAPE_SCRIPT='/usr/local/sbin/vps-tcp-safe-tuner-qdisc'
 readonly SHAPE_UNIT='/etc/systemd/system/vps-tcp-safe-tuner-qdisc.service'
 readonly SHAPE_STATE="$STATE_DIR/qdisc.tsv"
 readonly QDISC_TUNE_STATE="$STATE_DIR/qdisc-tune.tsv"
+readonly ROUTE_STATE="$STATE_DIR/route-window.tsv"
+readonly RUNTIME_SCRIPT='/usr/local/sbin/vps-tcp-safe-tuner-runtime'
+readonly RUNTIME_UNIT='/etc/systemd/system/vps-tcp-safe-tuner-runtime.service'
+readonly RUNTIME_TIMER='/etc/systemd/system/vps-tcp-safe-tuner-runtime.timer'
+readonly RUNTIME_MARKER='# Managed by vps-tcp-safe-tuner: runtime recovery.'
 readonly BBR_MODULE_FILE='/etc/modules-load.d/vps-tcp-safe-tuner-bbr.conf'
 readonly REPORT_DIR='/var/log/vps-tcp-safe-tuner'
 readonly MARKER='# Managed by vps-tcp-safe-tuner. Remove only with vps-tcp-tune rollback.'
@@ -33,6 +38,8 @@ DURATION='12'; WORKERS='4'; ROUNDS='3'; POLICER_ROUNDS='3'; PEER_MAX_RTT='120'; 
 TUNING_APPLIED=0; DEFER_PERSIST=0; BBR_MODULE_CONFIG_CREATED=0
 QDISC_SELECTED_FQ=0; QDISC_CHANGED=0; QDISC_ORIGINAL_IFACE=''; QDISC_ORIGINAL_KIND=''; QDISC_ORIGINAL_SPEC=''; QDISC_BACKUP_FILE=''
 NOISY_LINK=0
+INITCWND=32
+RECOMMENDED_SHAPE_RATE=''
 
 # 第三方公开 iperf3 节点。自动模式会按 RTT 排序、依次做短测试；用户也可用 --peer 覆盖。
 # 节点可用性会变化，因此自动选择失败时会给出明确提示，不会伪造测量结果。
@@ -199,6 +206,7 @@ validate_common() {
   is_positive_integer "$PEER_MAX_RTT" && (( PEER_MAX_RTT <= 1000 )) || fail '--peer-max-rtt 必须是 1 到 1000 的整数。'
   is_positive_integer "$MAX_TEST_GIB" && (( MAX_TEST_GIB <= 10000 )) || fail '--max-test-gib 必须是 1 到 10000 的整数。'
   is_positive_integer "$MAX_RATE_SPREAD_PERCENT" && (( MAX_RATE_SPREAD_PERCENT <= 200 )) || fail '--max-rate-spread 必须是 1 到 200 的整数。'
+  [[ $INITCWND =~ ^(0|[1-9][0-9]*)$ ]] && (( INITCWND <= 64 )) || fail '--initcwnd 必须为 0 到 64；0 表示不调整初始窗口。'
   [[ -z $BANDWIDTH_MBIT ]] || { is_positive_integer "$BANDWIDTH_MBIT" && (( BANDWIDTH_MBIT <= 100000 )) || fail '--bandwidth 必须是 1 到 100000 的整数。'; }
   [[ -z $RTT_MS ]] || { is_positive_integer "$RTT_MS" && (( RTT_MS <= 3000 )) || fail '--rtt 必须是 1 到 3000 的整数。'; }
 }
@@ -461,9 +469,17 @@ calculate_buffer() {
   memory=$(memory_mib); multiplier=2
   [[ -z $BUFFER_MULTIPLIER_OVERRIDE ]] || multiplier=$BUFFER_MULTIPLIER_OVERRIDE
   # BDP（字节）= 带宽 Mbit/s × RTT ms × 125；不能遗漏 Mbit/ms 到字节的单位换算。
-  bdp=$(( BANDWIDTH_MBIT * RTT_MS * 125 )); cap=$(( memory * 1024 * 1024 / 12 )); (( cap > 134217728 )) && cap=134217728
-  result=$(( bdp * multiplier )); (( result < 4194304 )) && result=4194304; (( result > cap )) && result=$cap; (( result < 4194304 )) && result=4194304
+  bdp=$(( BANDWIDTH_MBIT * RTT_MS * 125 )); cap=$(( memory * 1024 * 1024 / 32 )); (( cap > 268435456 )) && cap=268435456
+  result=$(( bdp * multiplier + 2097152 )); (( result < 4194304 )) && result=4194304; (( result > cap )) && result=$cap; (( result < 4194304 )) && result=4194304
   printf '%s' "$result"
+}
+calculate_tcp_mem() {
+  local bytes pages page_size
+  bytes=$(( $(memory_mib) * 1024 * 1024 ))
+  page_size=$(getconf PAGESIZE) || return 1
+  is_positive_integer "$page_size" || return 1
+  pages=$(( bytes / page_size ))
+  printf '%s %s %s' "$(( pages / 16 ))" "$(( pages / 8 ))" "$(( pages / 4 ))"
 }
 calculate_initial_rmem() {
   local ceiling=$1 initial
@@ -519,6 +535,7 @@ build_settings() {
   fi
   add_setting net.core.rmem_max "$buffer"; add_setting net.core.wmem_max "$buffer"
   add_setting net.ipv4.tcp_rmem "4096 $initial_rmem $buffer"; add_setting net.ipv4.tcp_wmem "4096 $initial_wmem $buffer"
+  add_setting net.ipv4.tcp_mem "$(calculate_tcp_mem)"
   add_setting net.ipv4.tcp_window_scaling 1; add_setting net.ipv4.tcp_moderate_rcvbuf 1
   add_setting net.ipv4.tcp_mtu_probing 1; add_setting net.ipv4.tcp_slow_start_after_idle 0
   add_setting net.core.netdev_max_backlog "$backlog"; add_setting net.core.somaxconn "$socket_queue"; add_setting net.ipv4.tcp_max_syn_backlog "$syn_queue"
@@ -545,6 +562,7 @@ show_environment() {
 show_plan() {
   local i buffer initial_rmem initial_wmem; buffer=$(calculate_buffer); initial_rmem=$(calculate_initial_rmem "$buffer"); initial_wmem=$(calculate_initial_wmem "$buffer"); show_environment
   say "用途=$ROLE；带宽=${BANDWIDTH_MBIT} Mbit/s；业务目标 RTT=${RTT_MS} ms；推导缓冲区上限=${buffer} 字节；初始接收/发送缓冲区=${initial_rmem}/${initial_wmem} 字节。"
+  say '缓冲区采用 BDP 倍率 + 2MiB 余量；单 socket 上限受内存 1/32 及 256MiB 约束。'
   for i in "${!KEYS[@]}"; do say "${KEYS[$i]}：$(sysctl_value "${KEYS[$i]}") -> ${VALUES[$i]}"; done
   if (( QDISC_EXPERIMENT )); then say '基础候选先保持原活动 qdisc；深度阶段会临时 A/B 测试 FQ，未胜出即精确恢复。'
   else say '将把默认 qdisc 设为 fq，并在精确保存当前活动队列后切换为 FQ；回滚会恢复原队列。'; fi
@@ -756,7 +774,9 @@ apply_tuning() {
       abort_transaction || fail '持久化失败，且部分参数未能恢复；事务快照已保留。'
       fail '持久化失败，已恢复本次应用前参数。'
     fi
-    discard_transaction; TUNING_APPLIED=1; ok "已应用 ${#KEYS[@]} 项自适应 TCP 设置。"
+    discard_transaction; TUNING_APPLIED=1
+    write_runtime_service || warn '网络恢复服务安装失败；当前配置有效，重启恢复尚未完成。'
+    ok "已应用 ${#KEYS[@]} 项自适应 TCP 设置。"
   fi
 }
 search_buffer_candidates() {
@@ -890,6 +910,7 @@ restore_root_qdisc() {
 }
 remove_qdisc_snapshot() {
   [[ ${1:-} == "$STATE_DIR"/qdisc-before-shape.* || ${1:-} == "$STATE_DIR"/qdisc-before-fq.* || ${1:-} == "$STATE_DIR"/qdisc-scan.* || ${1:-} == "$STATE_DIR"/qdisc-lab.* ]] && rm -f -- "$1"
+  return 0
 }
 active_qdisc_is_fq() {
   local iface=$1 output root
@@ -1205,6 +1226,7 @@ probe_shaper_candidate() {
   policer_candidate_is_clean "$MEASURE_RATE" "$MEASURE_RETRANS_PER_GIB" "$candidate_rate" "$baseline_retrans_per_gib"
 }
 scan_shaper_candidate() {
+  RECOMMENDED_SHAPE_RATE=''
   validate_peer; ensure_iperf3; require_command tc
   local nominal candidate best='' last_clean='' broke_at='' iface original original_spec snapshot saved_rounds saved_bidirectional baseline_retrans_per_gib qdisc_backup probe_status safe_rate
   local -a coarse=(85 92 99 106 114 123 133 145)
@@ -1254,6 +1276,7 @@ scan_shaper_candidate() {
   remove_qdisc_snapshot "$qdisc_backup"
   if [[ -n $best && -n $broke_at ]]; then
     safe_rate=$(( best * 97 / 100 )); (( safe_rate < 1 )) && safe_rate=1
+    RECOMMENDED_SHAPE_RATE=$safe_rate
     say "建议整形速率：${safe_rate} Mbit/s（拐点前 ${best}Mbit 留出 3% 余量）。"
     say "请用 shape --shape-rate ${safe_rate} --enable-shaping 后再 verify。"
   else
@@ -1336,11 +1359,148 @@ auto() {
   fi
   discard_transaction
   trap - INT TERM HUP
+  write_runtime_service || warn '网络恢复服务安装失败；当前 TCP 配置有效，重启后活动 FQ 尚未保证恢复。'
   ok '复测未出现明显退化，已保留候选 TCP 配置。'
   if (( ENABLE_SHAPING )); then
     if [[ $MEASURE_RETRANS_PER_GIB == 0 ]]; then say '验证无重传，跳过限速器扫描。';
     else warn '已启用限速器候选扫描。扫描只给出建议，不会持久化整形。'; scan_shaper_candidate; fi
   fi
+}
+tune_shaper() {
+  local base_rate base_retrans reverse_rate reverse_retrans iface snapshot kind spec backup saved_yes=$ASSUME_YES accepted=0
+  [[ ! -f $SHAPE_STATE ]] || { warn '已有受管整形，跳过重复扫描。'; return 0; }
+  if ! measure; then warn '验证样本不足；已保留完成的基础调优，跳过整形。'; return 0; fi
+  base_rate=$MEASURE_RATE; base_retrans=$MEASURE_RETRANS_PER_GIB
+  reverse_rate=${MEASURE_REVERSE_RATE:-0}; reverse_retrans=${MEASURE_REVERSE_RETRANS_PER_GIB:-0}
+  (( base_retrans > RETRANS_PER_GIB_HARD_LIMIT )) || { say '出站重传未达到扫描门槛，保持不整形。'; return 0; }
+  scan_shaper_candidate
+  [[ -n $RECOMMENDED_SHAPE_RATE ]] || return 0
+  iface=$(default_interface); backup=$(mktemp "$STATE_DIR/qdisc-lab.XXXXXX")
+  snapshot=$(qdisc_snapshot "$iface" "$backup") || { rm -f "$backup"; return 1; }
+  IFS=$'\t' read -r kind spec <<<"$snapshot"
+  trap 'restore_root_qdisc "$iface" "$kind" "$spec" || true; remove_qdisc_snapshot "$backup"' EXIT
+  trap 'exit 130' INT TERM HUP
+  if apply_shape "$iface" "$RECOMMENDED_SHAPE_RATE" && measure; then
+    if ! is_material_regression "$base_rate" "$base_retrans" "$MEASURE_RATE" "$MEASURE_RETRANS_PER_GIB" &&
+       { (( BIDIRECTIONAL == 0 )) || ! is_material_regression "$reverse_rate" "$reverse_retrans" "$MEASURE_REVERSE_RATE" "$MEASURE_REVERSE_RETRANS_PER_GIB"; }; then
+      if (( MEASURE_RATE * 100 >= base_rate * 105 )) ||
+         (( MEASURE_RATE * 100 >= base_rate * 95 && MEASURE_RETRANS_PER_GIB * 2 <= base_retrans )); then accepted=1; fi
+    fi
+  fi
+  restore_root_qdisc "$iface" "$kind" "$spec" || fail '候选整形验证后队列恢复失败；已保留恢复保护。'
+  trap - EXIT INT TERM HUP
+  remove_qdisc_snapshot "$backup"
+  if (( accepted )); then
+    SHAPE_RATE=$RECOMMENDED_SHAPE_RATE; ASSUME_YES=1
+    shape
+    ASSUME_YES=$saved_yes
+    ok '候选整形已通过同对端复测并持久化：吞吐提高至少 5%，或吞吐保持 95% 且重传减少至少一半。'
+  else say '候选整形未证实收益；保留基础调优及原队列，不持久化限速。'; fi
+}
+route_field() {
+  awk -v key="$1" '{for(i=1;i<NF;i++)if($i==key){print $(i+1);exit}}' <<<"$2"
+}
+route_with_windows() {
+  local route=$1 cw=$2 rw=$3 token skip=0
+  local -a words=() clean=()
+  # 只处理单一路径的 IPv4 默认路由，保留当前网关、metric、src 等其它属性。
+  [[ $route == default\ * && $route != *$'\n'* && $route != *'nexthop '* && $route != *' encap '* ]] || return 1
+  is_safe_iface "$(route_field dev "$route")" || return 1
+  [[ $cw =~ ^[0-9]+$ && $rw =~ ^[0-9]+$ ]] || return 1
+  IFS=' ' read -r -a words <<<"$route"
+  for token in "${words[@]}"; do
+    if (( skip )); then skip=0; continue; fi
+    case "$token" in initcwnd|initrwnd) skip=1 ;; expires) return 1 ;; *) clean+=("$token") ;; esac
+  done
+  (( cw == 0 )) || clean+=(initcwnd "$cw")
+  (( rw == 0 )) || clean+=(initrwnd "$rw")
+  ip -4 route change "${clean[@]}"
+}
+restore_route_windows() {
+  local iface cw rw value route
+  [[ -f $ROUTE_STATE ]] || return 0
+  IFS=$'\t' read -r iface cw rw value <"$ROUTE_STATE"
+  is_safe_iface "$iface" || return 1
+  route=$(ip -4 route show default dev "$iface") || return 1
+  [[ -n $route ]] || { warn '原网卡暂时没有默认路由；初始窗口快照保留，稍后重试回滚。'; return 1; }
+  route_with_windows "$route" "$cw" "$rw" || return 1
+  rm -f "$ROUTE_STATE"
+}
+apply_route_windows() {
+  local route iface cw rw temporary_file
+  (( INITCWND > 0 )) || return 0
+  [[ ! -e $ROUTE_STATE ]] || return 0
+  route=$(ip -4 route show default) || return 1
+  iface=$(route_field dev "$route")
+  if [[ -z $route || $route == *$'\n'* || $route == *'nexthop '* ]] || ! is_safe_iface "$iface"; then
+    warn '默认路由为多出口、IPv6-only 或特殊拓扑，已跳过初始窗口；基础 TCP 调优已保留。'; return 0
+  fi
+  cw=$(route_field initcwnd "$route"); rw=$(route_field initrwnd "$route")
+  temporary_file=$(mktemp "$STATE_DIR/route-window.XXXXXX") || return 1
+  printf '%s\t%s\t%s\t%s\n' "$iface" "${cw:-0}" "${rw:-0}" "$INITCWND" >"$temporary_file"
+  mv -f "$temporary_file" "$ROUTE_STATE" || return 1
+  if ! route_with_windows "$route" "$INITCWND" "$INITCWND"; then
+    rm -f "$ROUTE_STATE"
+    warn '当前路由不支持初始窗口设置；基础 TCP 调优已保留。'; return 0
+  fi
+  ok "已应用 initcwnd/initrwnd=$INITCWND，并保存原窗口；不写回旧网关。"
+}
+recover_runtime() {
+  local iface kind spec cw rw value route
+  if [[ -f $QDISC_TUNE_STATE && ! -f $SHAPE_STATE ]]; then
+    IFS=$'\t' read -r iface kind spec <"$QDISC_TUNE_STATE"
+    is_safe_iface "$iface" || return 1
+    if ip link show dev "$iface" >/dev/null 2>&1 && ! active_qdisc_is_fq "$iface"; then
+      kind=$(active_root_qdisc "$iface")
+      # 不覆盖用户新加的 HTB、CAKE 等策略。
+      case "$kind" in fq_codel|pfifo_fast|pfifo|bfifo|mq)
+        if [[ $kind == mq ]]; then
+          local temporary_file
+          temporary_file=$(mktemp)
+          qdisc_snapshot "$iface" "$temporary_file" >/dev/null || { rm -f "$temporary_file"; return 1; }
+          apply_fq_candidate "$iface" mq "$temporary_file" || { rm -f "$temporary_file"; return 1; }
+          rm -f "$temporary_file"
+        else tc qdisc replace dev "$iface" root fq || return 1; fi ;;
+      esac
+    fi
+  fi
+  if [[ -f $ROUTE_STATE ]]; then
+    IFS=$'\t' read -r iface cw rw value <"$ROUTE_STATE"
+    is_safe_iface "$iface" && is_positive_integer "$value" && (( value <= 64 )) || return 1
+    route=$(ip -4 route show default dev "$iface") || return 1
+    if [[ -n $route ]] && { [[ $(route_field initcwnd "$route") != "$value" ]] || [[ $(route_field initrwnd "$route") != "$value" ]]; }; then
+      route_with_windows "$route" "$value" "$value" || return 1
+    fi
+  fi
+}
+write_runtime_service() {
+  command -v systemctl >/dev/null 2>&1 && [[ -d /run/systemd/system ]] || {
+    warn '系统未运行 systemd；当前调优有效，但活动 FQ/初始窗口无法自动在重启后恢复。'; return 0;
+  }
+  local path temporary_file
+  for path in "$RUNTIME_SCRIPT" "$RUNTIME_UNIT" "$RUNTIME_TIMER"; do managed_file_or_absent "$path" "$RUNTIME_MARKER"; done
+  temporary_file=$(mktemp "${RUNTIME_SCRIPT}.XXXXXX") || return 1
+  {
+    printf '#!/usr/bin/env bash\n%s\nset -Eeuo pipefail\n' "$RUNTIME_MARKER"
+    printf 'readonly QDISC_TUNE_STATE=%q SHAPE_STATE=%q ROUTE_STATE=%q LOCK_FILE=%q\n' "$QDISC_TUNE_STATE" "$SHAPE_STATE" "$ROUTE_STATE" "$LOCK_FILE"
+    declare -f is_safe_iface is_positive_integer route_field route_with_windows recover_runtime active_root_qdisc active_qdisc_is_fq qdisc_leaf_is_restorable qdisc_snapshot qdisc_snapshot_mq apply_fq_candidate
+    printf 'exec 9>"$LOCK_FILE"\nflock -n 9 || exit 0\nrecover_runtime\n'
+  } >"$temporary_file"
+  chmod 700 "$temporary_file" && mv -f "$temporary_file" "$RUNTIME_SCRIPT" || return 1
+  temporary_file=$(mktemp "${RUNTIME_UNIT}.XXXXXX") || return 1
+  printf '%s\n[Unit]\nDescription=Restore managed TCP windows and FQ after network changes\nAfter=network-online.target\n[Service]\nType=oneshot\nExecStart=%s\nNoNewPrivileges=yes\nProtectSystem=strict\nProtectHome=yes\nPrivateTmp=yes\nCapabilityBoundingSet=CAP_NET_ADMIN\n' "$RUNTIME_MARKER" "$RUNTIME_SCRIPT" >"$temporary_file"
+  chmod 644 "$temporary_file" && mv -f "$temporary_file" "$RUNTIME_UNIT" || return 1
+  temporary_file=$(mktemp "${RUNTIME_TIMER}.XXXXXX") || return 1
+  printf '%s\n[Unit]\nDescription=Recheck managed TCP windows and FQ\n[Timer]\nOnBootSec=30s\nOnUnitInactiveSec=30s\nUnit=vps-tcp-safe-tuner-runtime.service\n[Install]\nWantedBy=timers.target\n' "$RUNTIME_MARKER" >"$temporary_file"
+  chmod 644 "$temporary_file" && mv -f "$temporary_file" "$RUNTIME_TIMER" || return 1
+  systemctl daemon-reload && systemctl enable --now vps-tcp-safe-tuner-runtime.timer
+}
+remove_runtime_service() {
+  local path
+  for path in "$RUNTIME_SCRIPT" "$RUNTIME_UNIT" "$RUNTIME_TIMER"; do managed_file_or_absent "$path" "$RUNTIME_MARKER"; done
+  if [[ -e $RUNTIME_TIMER ]]; then systemctl disable --now vps-tcp-safe-tuner-runtime.timer || return 1; fi
+  for path in "$RUNTIME_SCRIPT" "$RUNTIME_UNIT" "$RUNTIME_TIMER"; do remove_managed_file "$path" "$RUNTIME_MARKER"; done
+  if command -v systemctl >/dev/null 2>&1 && [[ -d /run/systemd/system ]]; then systemctl daemon-reload; fi
 }
 tune() {
   [[ -n $BANDWIDTH_MBIT ]] || fail 'tune 需要 --bandwidth（VPS 套餐或端口带宽，Mbit/s）。'
@@ -1350,6 +1510,12 @@ tune() {
   fi
   say '一键基础调优不依赖 iperf3 稳定性；将直接按套餐带宽、目标 RTT 和内存应用 BBR + FQ + 自适应缓冲区。'
   apply_tuning
+  (( DRY_RUN == 0 && TUNING_APPLIED )) || return 0
+  apply_route_windows || warn '初始窗口设置未完成；基础 TCP 配置已保留。'
+  write_runtime_service || warn '网络恢复服务安装失败；当前配置已生效，重启恢复尚未完成。'
+  if (( ENABLE_SHAPING )); then
+    tune_shaper
+  fi
 }
 deep() {
   BUFFER_SEARCH=1; QDISC_EXPERIMENT=1
@@ -1374,6 +1540,8 @@ status() {
 rollback() {
   require_root; require_linux; require_command sysctl; lock; [[ -f $SNAPSHOT_FILE ]] || fail '未找到首次快照；拒绝猜测系统原始值。'
   (( DRY_RUN )) && { say '将恢复 sysctl 与活动 qdisc 快照，并移除本工具配置和整形。'; return 0; }; confirm '恢复首次 sysctl/活动 qdisc 快照并移除本工具的持久化配置和整形吗？' || { say '已取消。'; return 0; }
+  remove_runtime_service || fail '无法停止网络恢复服务；已保留状态，避免回滚后被重新应用。'
+  restore_route_windows || fail '初始窗口恢复失败；路由快照保留，请恢复网卡连接后重试。'
   [[ -f $SHAPE_STATE ]] && { ASSUME_YES=1; unshape; }
   restore_snapshot_values || fail "部分 sysctl 恢复失败；配置和快照均已保留，请检查后重试：$SNAPSHOT_FILE"
   restore_managed_qdisc_tune || fail "sysctl 已恢复，但活动 qdisc 恢复失败；队列状态仍保留：$QDISC_TUNE_STATE"
@@ -1413,6 +1581,7 @@ EOF
 parse_options() {
   while (($#)); do case "$1" in
     --peer) PEER=${2:-}; shift 2 ;; --port) PEER_PORT=${2:-}; shift 2 ;; --role) ROLE=${2:-}; shift 2 ;; --bandwidth) BANDWIDTH_MBIT=${2:-}; shift 2 ;; --rtt) RTT_MS=${2:-}; shift 2 ;; --duration) DURATION=${2:-}; shift 2 ;; --workers) WORKERS=${2:-}; shift 2 ;; --rounds) ROUNDS=${2:-}; shift 2 ;; --policer-rounds) POLICER_ROUNDS=${2:-}; shift 2 ;; --peer-max-rtt) PEER_MAX_RTT=${2:-}; shift 2 ;; --max-test-gib) MAX_TEST_GIB=${2:-}; shift 2 ;; --max-rate-spread) MAX_RATE_SPREAD_PERCENT=${2:-}; shift 2 ;; --shape-rate) SHAPE_RATE=${2:-}; shift 2 ;;
+    --initcwnd) INITCWND=${2:-}; shift 2 ;;
     --enable-shaping) ENABLE_SHAPING=1; shift ;; --search-buffers) BUFFER_SEARCH=1; shift ;; --experiment-qdisc) QDISC_EXPERIMENT=1; shift ;; --allow-public-peers) ALLOW_PUBLIC_PEERS=1; shift ;; --allow-high-traffic) ALLOW_HIGH_TRAFFIC=1; shift ;; --forward-only) BIDIRECTIONAL=0; shift ;; --dry-run) DRY_RUN=1; shift ;; --yes) ASSUME_YES=1; shift ;; --no-install) NO_INSTALL=1; shift ;; --keep-on-regression) KEEP_ON_REGRESSION=1; shift ;; -h|--help) usage; exit 0 ;; *) fail "未知选项：$1" ;;
   esac; done
 }

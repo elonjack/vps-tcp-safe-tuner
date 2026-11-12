@@ -21,6 +21,8 @@ jobs:
         run: bash tests/test-shell.sh
       - name: 真实 qdisc 保存与恢复测试
         run: sudo bash tests/test-qdisc-linux.sh
+      - name: 隔离网络路由窗口与网关变更测试
+        run: sudo bash tests/test-route-linux.sh
       - name: ShellCheck
         uses: ludeeus/action-shellcheck@2.0.0
         with:

@@ -11,7 +11,7 @@
 SSH 登录 VPS 后，复制下面两行执行：
 
 ```bash
-curl -fLO https://github.com/elonjack/vps-tcp-safe-tuner/releases/download/v6.0.1/install.sh
+curl -fLO https://github.com/elonjack/vps-tcp-safe-tuner/releases/download/v6.1.0/install.sh
 bash install.sh
 ```
 
@@ -96,6 +96,25 @@ sudo vps-tcp-tune apply --bandwidth 1000 --rtt 150 --role proxy --dry-run
 
 ## 常用命令
 
+3Gbps 代理 VPS 可直接执行：
+
+```bash
+sudo vps-tcp-tune tune --bandwidth 3000 --role proxy
+```
+
+`tune` 同时设置 `initcwnd/initrwnd=32`，原值会保存。用 `--initcwnd 0` 可跳过窗口调整。systemd 恢复服务每 30 秒检查一次，在同一网卡重连、DHCP 更新或重启后补回受管 FQ 和窗口；回滚时先停服务，再恢复原窗口值，沿用当前网关。仅支持单一 IPv4 默认路由，不覆盖策略路由和多路径路由。
+
+TCP 内存预算按真实页大小推导为总内存的 1/16、1/8、1/4；单 socket 上限采用 2×BDP + 2MiB，并受内存 1/32 与 256MiB 约束。上限并非预分配。Linux 6.6 起废弃的 `tcp_adv_win_scale` 不作为有效调优项写入。
+
+如果还要自动扫描并验证整形，指定可信近端 iperf3 对端：
+
+```bash
+sudo vps-tcp-tune tune --bandwidth 3000 --role proxy \
+  --peer 你的近端测速服务器IP --enable-shaping --duration 5 --rounds 3
+```
+
+只有测量可靠且重传较高时才进入扫描；候选整形经复测达到“吞吐提高至少 5%”，或“吞吐保持 95% 且重传至少减半”，并且任一方向无明显退化，才自动持久化。测量不足时保留已完成的基础调优，不会宣称测速优化成功。扫描会产生较多实际流量，超过默认护栏仍需 `--allow-high-traffic`。
+
 | 想做什么 | 命令 |
 | --- | --- |
 | 打开中文菜单 | `sudo vps-tcp-tune` |
@@ -116,7 +135,7 @@ sudo vps-tcp-tune apply --bandwidth 1000 --rtt 150 --role proxy --dry-run
 - 使用至少五轮测试时，可使用占多数且仍满足波动门槛的稳定样本簇；被剔除轮次的流量仍计入上限。没有多数稳定簇时仍会停止。
 - 流量有限时可在高级命令末尾加 `--forward-only`，只测 VPS 出站；判断会少一个方向的证据。
 - `--allow-public-peers` 表示允许连接内置第三方 iperf3 节点；对端会看到 VPS 的公网 IP。
-- 脚本不会修改防火墙、SSH、路由、swap，也不会下载新内核。
+- 脚本不会修改防火墙、SSH、swap，也不会下载新内核。`tune` 会调整单一 IPv4 默认路由的初始窗口，保留当前网关及其它路由属性；多出口、IPv6-only 和特殊路由会跳过该项。
 - 一键/标准模式会在保存精确快照后应用活动 FQ；遇到无法精确恢复的特殊 qdisc 会拒绝修改。深度模式会先 A/B，未达择优门槛就恢复原队列。
 - OpenVZ/LXC 可能禁止 BBR、sysctl 或 qdisc，遇到限制时脚本会停止，不会强行修改。
 

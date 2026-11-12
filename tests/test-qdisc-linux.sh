@@ -19,7 +19,8 @@ IFS=$'\t' read -r original_kind original_spec <<<"$snapshot"
 [[ $original_kind == fq_codel ]] || { printf '未取得 fq_codel 快照。\n' >&2; exit 1; }
 [[ $original_spec == *'limit 2048p'* ]] || { printf '测试内核没有返回预期的 tc limit 显示格式。\n' >&2; exit 1; }
 
-tc qdisc replace dev "$iface" root fq
+apply_fq_candidate "$iface" "$original_kind" "$original_spec"
+active_qdisc_is_fq "$iface" || { printf '活动 FQ 未生效。\n' >&2; exit 1; }
 restore_root_qdisc "$iface" "$original_kind" "$original_spec"
 restored=$(tc qdisc show dev "$iface")
 [[ $restored == *'qdisc fq_codel'* && $restored == *'limit 2048p'* ]] || {

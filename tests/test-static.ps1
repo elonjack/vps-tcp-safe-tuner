@@ -47,7 +47,7 @@ if ($content -notmatch 'SHAPE_SCRIPT_MARKER') { throw 'Persistent shaping script
 if ($content -notmatch 'SHAPE_UNIT_MARKER') { throw 'Persistent shaping unit needs an ownership marker.' }
 if ($content -notmatch 'validate_iface') { throw 'Interface names must be validated before persistence.' }
 if ($content -notmatch '部分 sysctl 恢复失败；配置和快照均已保留') { throw 'Rollback must retain evidence after partial restore failure.' }
-if ($installContent -notmatch "readonly VERSION='6\.0\.1'") { throw 'Installer version is stale.' }
+if ($installContent -notmatch "readonly VERSION='6\.1\.0'") { throw 'Installer version is stale.' }
 if ($installContent -match "EXPECTED_SHA256='TO_BE_REPLACED'") { throw 'Installer checksum placeholder was not replaced.' }
 if ($installContent -notmatch '--local') { throw 'Installer needs an offline/local verified path.' }
 $expectedMatch = [regex]::Match($installContent, "EXPECTED_SHA256='([0-9a-f]{64})'")
