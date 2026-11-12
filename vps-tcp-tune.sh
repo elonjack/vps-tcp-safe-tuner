@@ -1488,7 +1488,7 @@ write_runtime_service() {
   } >"$temporary_file"
   chmod 700 "$temporary_file" && mv -f "$temporary_file" "$RUNTIME_SCRIPT" || return 1
   temporary_file=$(mktemp "${RUNTIME_UNIT}.XXXXXX") || return 1
-  printf '%s\n[Unit]\nDescription=Restore managed TCP windows and FQ after network changes\nAfter=network-online.target\n[Service]\nType=oneshot\nExecStart=%s\nNoNewPrivileges=yes\nProtectSystem=strict\nProtectHome=yes\nPrivateTmp=yes\nCapabilityBoundingSet=CAP_NET_ADMIN\n' "$RUNTIME_MARKER" "$RUNTIME_SCRIPT" >"$temporary_file"
+  printf '%s\n[Unit]\nDescription=Restore managed TCP windows and FQ after network changes\nAfter=network-online.target\n[Service]\nType=oneshot\nExecStart=%s\nNoNewPrivileges=yes\nProtectSystem=strict\nReadWritePaths=/run/lock\nProtectHome=yes\nPrivateTmp=yes\nCapabilityBoundingSet=CAP_NET_ADMIN\n' "$RUNTIME_MARKER" "$RUNTIME_SCRIPT" >"$temporary_file"
   chmod 644 "$temporary_file" && mv -f "$temporary_file" "$RUNTIME_UNIT" || return 1
   temporary_file=$(mktemp "${RUNTIME_TIMER}.XXXXXX") || return 1
   printf '%s\n[Unit]\nDescription=Recheck managed TCP windows and FQ\n[Timer]\nOnBootSec=30s\nOnUnitInactiveSec=30s\nUnit=vps-tcp-safe-tuner-runtime.service\n[Install]\nWantedBy=timers.target\n' "$RUNTIME_MARKER" >"$temporary_file"
