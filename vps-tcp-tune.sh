@@ -6,7 +6,7 @@ set -Eeuo pipefail
 IFS=$'\n\t'
 umask 077
 
-readonly VERSION='5.0.1'
+readonly VERSION='5.1.0'
 readonly STATE_DIR='/var/lib/vps-tcp-safe-tuner'
 readonly SNAPSHOT_FILE="$STATE_DIR/baseline.tsv"
 readonly TRANSACTION_FILE="$STATE_DIR/transaction.tsv"
@@ -339,7 +339,8 @@ run_measure_iperf() {
   return 1
 }
 measure_direction() {
-  local direction=$1 label=$2 temporary_file round valid required rate retrans transfer_mib median_position minimum maximum
+  local direction=$1 label=$2 temporary_file inlier_file='' stats_file round valid required rate retrans transfer_mib
+  local median_position minimum maximum actual_transfer_mib metric_transfer_mib inliers discarded
   DIRECTION_RATE=''; DIRECTION_RETRANS=''; DIRECTION_RETRANS_PER_GIB=''; DIRECTION_TRANSFER_MIB=''; DIRECTION_RATE_SPREAD=''
   temporary_file=$(mktemp)
   chmod 600 "$temporary_file"
@@ -369,20 +370,40 @@ measure_direction() {
     warn "$MEASURE_FAILURE；拒绝据此调优。"
     return 1
   fi
+  actual_transfer_mib=$(awk -F'\t' '{total += $3} END {printf "%.0f", total}' "$temporary_file")
+  stats_file=$temporary_file
   median_position=$(( (valid + 1) / 2 ))
-  DIRECTION_RATE=$(sort -n -k 1,1 "$temporary_file" | awk -v position="$median_position" 'NR == position {print $1}')
-  DIRECTION_RETRANS=$(awk -F'\t' '{total += $2} END {printf "%.0f", total}' "$temporary_file")
-  DIRECTION_TRANSFER_MIB=$(awk -F'\t' '{total += $3} END {printf "%.0f", total}' "$temporary_file")
-  minimum=$(sort -n -k 1,1 "$temporary_file" | awk 'NR==1{print $1}')
-  maximum=$(sort -n -k 1,1 "$temporary_file" | awk 'END{print $1}')
+  DIRECTION_RATE=$(sort -n -k 1,1 "$stats_file" | awk -v position="$median_position" 'NR == position {print $1}')
+  minimum=$(sort -n -k 1,1 "$stats_file" | awk 'NR==1{print $1}')
+  maximum=$(sort -n -k 1,1 "$stats_file" | awk 'END{print $1}')
   DIRECTION_RATE_SPREAD=$(awk -v low="$minimum" -v high="$maximum" -v median="$DIRECTION_RATE" 'BEGIN {if(median>0)printf "%.0f",(high-low)*100/median;else print 999}')
-  DIRECTION_RETRANS_PER_GIB=$(retrans_per_gib "$DIRECTION_RETRANS" "$DIRECTION_TRANSFER_MIB")
-  rm -f "$temporary_file"
+  if (( DIRECTION_RATE_SPREAD > MAX_RATE_SPREAD_PERCENT && valid >= 5 )); then
+    inlier_file=$(mktemp); chmod 600 "$inlier_file"
+    awk -F'\t' -v median="$DIRECTION_RATE" -v threshold="$MAX_RATE_SPREAD_PERCENT" '
+      {deviation=$1-median; if(deviation<0)deviation=-deviation; if(median>0 && deviation*100/median<=threshold)print}
+    ' "$temporary_file" >"$inlier_file"
+    inliers=$(awk 'END{print NR}' "$inlier_file")
+    if (( inliers >= valid - 1 )); then
+      discarded=$(( valid - inliers )); stats_file=$inlier_file; valid=$inliers
+      warn "${label}检测到 $discarded 轮明显离群样本；其吞吐/重传不参与候选评分，但流量仍计入上限。"
+      median_position=$(( (valid + 1) / 2 ))
+      DIRECTION_RATE=$(sort -n -k 1,1 "$stats_file" | awk -v position="$median_position" 'NR == position {print $1}')
+      minimum=$(sort -n -k 1,1 "$stats_file" | awk 'NR==1{print $1}')
+      maximum=$(sort -n -k 1,1 "$stats_file" | awk 'END{print $1}')
+      DIRECTION_RATE_SPREAD=$(awk -v low="$minimum" -v high="$maximum" -v median="$DIRECTION_RATE" 'BEGIN {if(median>0)printf "%.0f",(high-low)*100/median;else print 999}')
+    fi
+  fi
   if (( DIRECTION_RATE_SPREAD > MAX_RATE_SPREAD_PERCENT )); then
+    rm -f "$temporary_file"; [[ -z $inlier_file ]] || rm -f "$inlier_file"
     MEASURE_FAILURE="${label}多轮吞吐波动 ${DIRECTION_RATE_SPREAD}%（${minimum}-${maximum} Mbit/s），超过 ${MAX_RATE_SPREAD_PERCENT}% 上限"
     warn "$MEASURE_FAILURE；当前对端或线路不稳定，拒绝据此调优。"
     return 1
   fi
+  DIRECTION_RETRANS=$(awk -F'\t' '{total += $2} END {printf "%.0f", total}' "$stats_file")
+  metric_transfer_mib=$(awk -F'\t' '{total += $3} END {printf "%.0f", total}' "$stats_file")
+  DIRECTION_TRANSFER_MIB=$actual_transfer_mib
+  DIRECTION_RETRANS_PER_GIB=$(retrans_per_gib "$DIRECTION_RETRANS" "$metric_transfer_mib")
+  rm -f "$temporary_file"; [[ -z $inlier_file ]] || rm -f "$inlier_file"
   say "${label}汇总：中位 ${DIRECTION_RATE} Mbit/s；重传 ${DIRECTION_RETRANS}；约 ${DIRECTION_RETRANS_PER_GIB} 次/GiB；波动 ${DIRECTION_RATE_SPREAD}%。"
 }
 measure() {
@@ -624,6 +645,12 @@ is_material_regression() {
   fi
   return 1
 }
+candidate_retrans_is_acceptable() {
+  local baseline=$1 candidate=$2 allowed
+  allowed=$(( baseline * 2 + RETRANS_PER_GIB_MARGIN ))
+  (( allowed < RETRANS_PER_GIB_HARD_LIMIT )) && allowed=$RETRANS_PER_GIB_HARD_LIMIT
+  (( candidate <= allowed ))
+}
 REGRESSION_REASON=''
 revert_auto_experiment() {
   warn '复测失败或出现明显退化，正在恢复本次应用前的 TCP 参数。'
@@ -729,6 +756,8 @@ apply_tuning() {
 }
 search_buffer_candidates() {
   local saved_override=$BUFFER_MULTIPLIER_OVERRIDE saved_rounds=$ROUNDS candidate candidate_rate candidate_retrans candidate_reverse_rate candidate_reverse_retrans candidate_score
+  local reference_rate=${MEASURE_RATE:-0} reference_retrans=${MEASURE_RETRANS_PER_GIB:-0}
+  local reference_reverse_rate=${MEASURE_REVERSE_RATE:-0} reference_reverse_retrans=${MEASURE_REVERSE_RETRANS_PER_GIB:-0} candidate_clean
   local best_multiplier='' best_rate=0 best_reverse_rate=0 best_retrans=0 best_reverse_retrans=0 best_score=0 search_tests=6
   local -a candidates=(1 2 3)
   (( BIDIRECTIONAL )) && search_tests=12
@@ -752,7 +781,14 @@ search_buffer_candidates() {
     candidate_reverse_rate=${MEASURE_REVERSE_RATE:-0}; candidate_reverse_retrans=${MEASURE_REVERSE_RETRANS_PER_GIB:-0}
     candidate_score=$candidate_rate; (( BIDIRECTIONAL == 0 )) || candidate_score=$(( candidate_score + candidate_reverse_rate ))
     say "${candidate}× BDP：出站/入站 ${candidate_rate}/${candidate_reverse_rate} Mbit；重传 ${candidate_retrans}/${candidate_reverse_retrans} 次/GiB。"
-    if (( candidate_retrans <= RETRANS_PER_GIB_HARD_LIMIT && candidate_reverse_retrans <= RETRANS_PER_GIB_HARD_LIMIT && candidate_score > best_score )); then
+    candidate_clean=1
+    if is_material_regression "$reference_rate" "$reference_retrans" "$candidate_rate" "$candidate_retrans" '缓冲区出站'; then candidate_clean=0; fi
+    candidate_retrans_is_acceptable "$reference_retrans" "$candidate_retrans" || candidate_clean=0
+    if (( BIDIRECTIONAL )); then
+      if is_material_regression "$reference_reverse_rate" "$reference_reverse_retrans" "$candidate_reverse_rate" "$candidate_reverse_retrans" '缓冲区入站'; then candidate_clean=0; fi
+      candidate_retrans_is_acceptable "$reference_reverse_retrans" "$candidate_reverse_retrans" || candidate_clean=0
+    fi
+    if (( candidate_clean && candidate_score > best_score )); then
       best_multiplier=$candidate; best_rate=$candidate_rate; best_reverse_rate=$candidate_reverse_rate
       best_retrans=$candidate_retrans; best_reverse_retrans=$candidate_reverse_retrans; best_score=$candidate_score
     fi
@@ -762,7 +798,7 @@ search_buffer_candidates() {
     BUFFER_MULTIPLIER_OVERRIDE=$saved_override
     build_settings
     apply_built_settings || { abort_transaction || fail '所有缓冲区候选均失败，且部分参数未能恢复；事务快照已保留。'; fail '所有缓冲区候选均失败，已恢复本次应用前参数。'; }
-    warn '没有重传可接受的缓冲区候选，已恢复搜索前配置。'
+    warn '没有相对基线可接受的缓冲区候选，已恢复搜索前配置。'
     return 0
   fi
   BUFFER_MULTIPLIER_OVERRIDE=$best_multiplier

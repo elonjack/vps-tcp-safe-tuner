@@ -58,11 +58,11 @@ assert_equals 'iperf3: error - the server is busy' "$(compact_iperf_error $'noti
 MEASURE_FIXTURE=unstable TEST_INDEX=0
 run_measure_iperf() {
   local -a rates retransfers transfers
-  if [[ $MEASURE_FIXTURE == unstable ]]; then
-    rates=(1450 2610 1550); retransfers=(2952 1451 2473); transfers=(2175 3915 2325)
-  else
-    rates=(1500 1550 1600); retransfers=(100 110 120); transfers=(2250 2325 2400)
-  fi
+  case "$MEASURE_FIXTURE" in
+    unstable) rates=(1450 2610 1550); retransfers=(2952 1451 2473); transfers=(2175 3915 2325) ;;
+    one_outlier) rates=(109 132 149 39 115); retransfers=(4905 6805 1536 125 2219); transfers=(104 127 140 38 110) ;;
+    *) rates=(1500 1550 1600); retransfers=(100 110 120); transfers=(2250 2325 2400) ;;
+  esac
   MEASURE_RATE=${rates[$TEST_INDEX]}; MEASURE_RETRANS=${retransfers[$TEST_INDEX]}; MEASURE_TRANSFER_MIB=${transfers[$TEST_INDEX]}
   TEST_INDEX=$(( TEST_INDEX + 1 ))
 }
@@ -73,6 +73,13 @@ MEASURE_FIXTURE=stable TEST_INDEX=0
 measure_direction forward '出站' >/dev/null 2>&1 || { printf '稳定基线被错误拒绝。\n' >&2; exit 1; }
 assert_equals 1550 "$DIRECTION_RATE" '稳定样本中位吞吐'
 assert_equals 6 "$DIRECTION_RATE_SPREAD" '稳定样本波动率'
+export ROUNDS=5 MEASURE_STAGE_TRANSFER_MIB=0
+MEASURE_FIXTURE=one_outlier TEST_INDEX=0
+measure_direction forward '出站' >/dev/null 2>&1 || { printf '五轮中单个离群样本未被安全剔除。\n' >&2; exit 1; }
+assert_equals 115 "$DIRECTION_RATE" '离群过滤后的中位吞吐'
+assert_equals 35 "$DIRECTION_RATE_SPREAD" '离群过滤后的波动率'
+assert_equals 15465 "$DIRECTION_RETRANS" '离群轮重传未参与评分'
+assert_equals 519 "$DIRECTION_TRANSFER_MIB" '离群轮实际流量仍计入总量'
 export ROUNDS=1 MAX_TEST_GIB=1 MEASURE_STAGE_TRANSFER_MIB=0
 MEASURE_FIXTURE=stable TEST_INDEX=0
 if measure_direction forward '出站' >/dev/null 2>&1; then printf '实际传输量运行中护栏未生效。\n' >&2; exit 1; fi
@@ -127,5 +134,8 @@ if is_material_regression 100 1000 100 3500; then printf '归一化重传边界�
 if ! is_material_regression 1550 1009 4660 85514; then printf '真实异常样本未触发回滚。\n' >&2; exit 1; fi
 [[ $REGRESSION_REASON == *'85514 次/GiB'* ]] || { printf '回滚原因没有给出归一化重传数据。\n' >&2; exit 1; }
 if ! is_material_regression 100 1000 80 1000; then printf '吞吐退化回滚判断失败。\n' >&2; exit 1; fi
+candidate_retrans_is_acceptable 1000 2500 || { printf '相对基线重传边界被错误拒绝。\n' >&2; exit 1; }
+if candidate_retrans_is_acceptable 1000 2501; then printf '超过相对基线重传边界的候选被错误接受。\n' >&2; exit 1; fi
+candidate_retrans_is_acceptable 30000 60000 || { printf '高损耗基线的相对候选被错误拒绝。\n' >&2; exit 1; }
 
 printf 'Shell 功能测试通过。\n'

@@ -11,7 +11,7 @@
 SSH 登录 VPS 后，复制下面两行执行：
 
 ```bash
-curl -fLO https://github.com/elonjack/vps-tcp-safe-tuner/releases/download/v5.0.1/install.sh
+curl -fLO https://github.com/elonjack/vps-tcp-safe-tuner/releases/download/v5.1.0/install.sh
 bash install.sh
 ```
 
@@ -111,6 +111,7 @@ sudo vps-tcp-tune apply --bandwidth 1000 --rtt 150 --role proxy --dry-run
 - 自动模式会产生真实测速流量。每个测量阶段默认上限 20 GiB；除了事前估算，还会按实际传输字节在运行中停止后续测试。
 - 默认分别测试 VPS 出站和入站，并按实际传输量计算“每 GiB 重传次数”。
 - 三轮吞吐波动超过 40% 时会判定公共节点不稳定，在修改系统之前停止。
+- 使用至少五轮测试时，仅允许安全剔除一轮明显离群样本；其流量仍计入上限。两轮和三轮候选不会放宽。
 - 流量有限时可在高级命令末尾加 `--forward-only`，只测 VPS 出站；判断会少一个方向的证据。
 - `--allow-public-peers` 表示允许连接内置第三方 iperf3 节点；对端会看到 VPS 的公网 IP。
 - 脚本不会修改防火墙、SSH、路由、swap，也不会下载新内核。
