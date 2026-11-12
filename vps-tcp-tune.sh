@@ -6,7 +6,7 @@ set -Eeuo pipefail
 IFS=$'\n\t'
 umask 077
 
-readonly VERSION='6.0.0'
+readonly VERSION='6.0.1'
 readonly STATE_DIR='/var/lib/vps-tcp-safe-tuner'
 readonly SNAPSHOT_FILE="$STATE_DIR/baseline.tsv"
 readonly TRANSACTION_FILE="$STATE_DIR/transaction.tsv"
@@ -1398,7 +1398,9 @@ EOF
       yellow '[套餐带宽 Mbit/s（推荐填数字；回车则先自动测速）] '; read -r BANDWIDTH_MBIT
       yellow '[用途 general=通用 / proxy=代理加速 / server=建站服务，默认 proxy] '; read -r ROLE; ROLE=${ROLE:-proxy}
       if [[ -n $BANDWIDTH_MBIT ]]; then
-        yellow '[业务目标 RTT ms，回车默认 150] '; read -r RTT_MS; RTT_MS=${RTT_MS:-$AUTO_TARGET_RTT_MS}; tune
+        RTT_MS=$AUTO_TARGET_RTT_MS
+        say "基础调优默认按 ${RTT_MS}ms 跨境目标 RTT 推导；高级用法可用 tune --rtt 覆盖。"
+        tune
       else
         yellow '[对端域名或 IPv4，回车自动选择公共节点] '; read -r PEER; auto
       fi

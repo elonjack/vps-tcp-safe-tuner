@@ -11,7 +11,7 @@
 SSH 登录 VPS 后，复制下面两行执行：
 
 ```bash
-curl -fLO https://github.com/elonjack/vps-tcp-safe-tuner/releases/download/v6.0.0/install.sh
+curl -fLO https://github.com/elonjack/vps-tcp-safe-tuner/releases/download/v6.0.1/install.sh
 bash install.sh
 ```
 
@@ -39,7 +39,7 @@ sudo vps-tcp-tune
 
 1. “套餐带宽”填 VPS 商家标注的 Mbit/s，例如 `1000`。这是推荐方式。
 2. “用途”输入 `proxy`。
-3. “业务目标 RTT”填真实用户到 VPS 的典型延迟；不确定就直接回车，默认 `150`。
+3. 基础调优会自动按 `150ms` 跨境目标 RTT 推导，不用再回答 RTT 问题。
 4. 脚本显示修改计划后，确认无误输入 `y`。
 
 这条路径不需要 iperf3，会直接完成“精确快照 → BBR + 活动 FQ → 自适应缓冲区 → 持久化”。不满意可用菜单 `6` 精确回滚。
@@ -100,7 +100,7 @@ sudo vps-tcp-tune apply --bandwidth 1000 --rtt 150 --role proxy --dry-run
 | --- | --- |
 | 打开中文菜单 | `sudo vps-tcp-tune` |
 | 只检查环境 | `sudo vps-tcp-tune audit` |
-| 按 1000M 带宽一键调优代理 VPS | `sudo vps-tcp-tune tune --bandwidth 1000 --rtt 150 --role proxy` |
+| 按 1000M 带宽一键调优代理 VPS | `sudo vps-tcp-tune tune --bandwidth 1000 --role proxy` |
 | 自动测速并调优代理 VPS | `sudo vps-tcp-tune auto --role proxy --allow-public-peers` |
 | 深度实验并自动择优 | `sudo vps-tcp-tune deep --role proxy --allow-public-peers` |
 | 查看状态 | `sudo vps-tcp-tune status` |

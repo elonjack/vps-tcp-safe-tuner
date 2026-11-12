@@ -28,6 +28,7 @@ if ($content -notmatch 'inliers >= required') { throw 'Missing majority-cluster 
 if ($content -notmatch 'NOISY_LINK=0') { throw 'Missing noisy-link classification.' }
 if ($content -notmatch 'apply_managed_fq') { throw 'Missing directly managed active FQ application.' }
 if ($content -notmatch 'tune --bandwidth N') { throw 'Missing benchmark-independent one-click tuning path.' }
+if ($content -match "yellow '\[业务目标 RTT") { throw 'The beginner menu must not require a misleading point RTT sample.' }
 if ($content -notmatch 'candidate_retrans_is_acceptable') { throw 'Missing baseline-relative buffer candidate retransmission guard.' }
 if ($content -notmatch 'command\+=\(-R\)') { throw 'Missing iperf3 reverse-direction measurement.' }
 if ($content -notmatch 'qdisc_candidate_is_better') { throw 'Missing measured FQ candidate selection.' }
@@ -46,7 +47,7 @@ if ($content -notmatch 'SHAPE_SCRIPT_MARKER') { throw 'Persistent shaping script
 if ($content -notmatch 'SHAPE_UNIT_MARKER') { throw 'Persistent shaping unit needs an ownership marker.' }
 if ($content -notmatch 'validate_iface') { throw 'Interface names must be validated before persistence.' }
 if ($content -notmatch '部分 sysctl 恢复失败；配置和快照均已保留') { throw 'Rollback must retain evidence after partial restore failure.' }
-if ($installContent -notmatch "readonly VERSION='6\.0\.0'") { throw 'Installer version is stale.' }
+if ($installContent -notmatch "readonly VERSION='6\.0\.1'") { throw 'Installer version is stale.' }
 if ($installContent -match "EXPECTED_SHA256='TO_BE_REPLACED'") { throw 'Installer checksum placeholder was not replaced.' }
 if ($installContent -notmatch '--local') { throw 'Installer needs an offline/local verified path.' }
 $expectedMatch = [regex]::Match($installContent, "EXPECTED_SHA256='([0-9a-f]{64})'")
