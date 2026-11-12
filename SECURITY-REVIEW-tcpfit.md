@@ -32,7 +32,7 @@
 
 除 BBR、FQ 和 TCP 缓冲区外，tcpfit 还设置全局 socket 默认缓冲区、`vm.min_free_kbytes`、`fs.file-max`、较短的 `tcp_fin_timeout`、扩大的本地端口范围、TCP Fast Open 以及路由 `initcwnd/initrwnd`。这些设置未必恶意，但会影响 UDP、内存保留、文件句柄或所有 TCP 业务，风险面明显大于“只调 TCP”。固定的 `vm.min_free_kbytes=32768` 对极小内存 VPS 也未必合适。
 
-本项目刻意不修改全局 `rmem_default/wmem_default`、VM、文件句柄、防火墙、路由、swap 和 SSH，只管理与目标直接相关且可快照恢复的少量 sysctl；活动 qdisc 仅在显式整形时修改。
+本项目刻意不修改全局 `rmem_default/wmem_default`、VM、文件句柄、防火墙、路由、swap 和 SSH，只管理与目标直接相关且可快照恢复的 sysctl；活动 qdisc 只在完整保存可恢复快照后才会切换为 FQ 或进行显式整形。
 
 ### 信息：项目带有推广内容
 

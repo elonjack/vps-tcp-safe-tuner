@@ -61,6 +61,8 @@ run_measure_iperf() {
   case "$MEASURE_FIXTURE" in
     unstable) rates=(1450 2610 1550); retransfers=(2952 1451 2473); transfers=(2175 3915 2325) ;;
     one_outlier) rates=(109 132 149 39 115); retransfers=(4905 6805 1536 125 2219); transfers=(104 127 140 38 110) ;;
+    noisy_majority) rates=(62 118 38 83 71); retransfers=(587 5558 369 1128 3155); transfers=(62 114 36 79 69) ;;
+    chaotic) rates=(582 592 35 330 50); retransfers=(553 3569 0 556 530); transfers=(558 567 36 319 49) ;;
     *) rates=(1500 1550 1600); retransfers=(100 110 120); transfers=(2250 2325 2400) ;;
   esac
   MEASURE_RATE=${rates[$TEST_INDEX]}; MEASURE_RETRANS=${retransfers[$TEST_INDEX]}; MEASURE_TRANSFER_MIB=${transfers[$TEST_INDEX]}
@@ -80,6 +82,15 @@ assert_equals 115 "$DIRECTION_RATE" '离群过滤后的中位吞吐'
 assert_equals 35 "$DIRECTION_RATE_SPREAD" '离群过滤后的波动率'
 assert_equals 15465 "$DIRECTION_RETRANS" '离群轮重传未参与评分'
 assert_equals 519 "$DIRECTION_TRANSFER_MIB" '离群轮实际流量仍计入总量'
+MEASURE_FIXTURE=noisy_majority TEST_INDEX=0 MEASURE_STAGE_TRANSFER_MIB=0
+measure_direction forward '出站' >/dev/null 2>&1 || { printf '五轮中多数稳定样本簇被错误拒绝。\n' >&2; exit 1; }
+assert_equals 71 "$DIRECTION_RATE" '噪声线路多数簇中位吞吐'
+assert_equals 30 "$DIRECTION_RATE_SPREAD" '噪声线路多数簇波动率'
+assert_equals 4870 "$DIRECTION_RETRANS" '噪声线路离群轮重传未参与评分'
+assert_equals 360 "$DIRECTION_TRANSFER_MIB" '噪声线路离群轮流量仍计入总量'
+assert_equals 1 "$DIRECTION_NOISY" '噪声线路标记'
+MEASURE_FIXTURE=chaotic TEST_INDEX=0 MEASURE_STAGE_TRANSFER_MIB=0
+if measure_direction forward '出站' >/dev/null 2>&1; then printf '没有多数稳定簇的五轮样本被错误接受。\n' >&2; exit 1; fi
 export ROUNDS=1 MAX_TEST_GIB=1 MEASURE_STAGE_TRANSFER_MIB=0
 MEASURE_FIXTURE=stable TEST_INDEX=0
 if measure_direction forward '出站' >/dev/null 2>&1; then printf '实际传输量运行中护栏未生效。\n' >&2; exit 1; fi
@@ -123,9 +134,14 @@ drop_setting two
 assert_equals 'one three' "${KEYS[0]} ${KEYS[1]}" '候选设置删除'
 
 export BIDIRECTIONAL=1
+export NOISY_LINK=0
 qdisc_candidate_is_better 100 1000 100 1000 106 1000 106 1000 || { printf '双向提升的 FQ 候选未被选择。\n' >&2; exit 1; }
 if qdisc_candidate_is_better 100 1000 100 1000 120 1000 94 1000; then printf '单方向退化的 FQ 候选被错误选择。\n' >&2; exit 1; fi
 if qdisc_candidate_is_better 100 1000 100 1000 106 4000 106 1000; then printf '高重传 FQ 候选被错误选择。\n' >&2; exit 1; fi
+export NOISY_LINK=1
+if qdisc_candidate_is_better 100 1000 100 1000 119 1000 119 1000; then printf '噪声线路未达 20%% 提升的 FQ 候选被错误选择。\n' >&2; exit 1; fi
+qdisc_candidate_is_better 100 1000 100 1000 120 1000 120 1000 || { printf '噪声线路达到 20%% 提升的 FQ 候选未被选择。\n' >&2; exit 1; }
+export NOISY_LINK=0
 
 policer_candidate_is_clean 950 1800 1000 0 || { printf '限速器干净候选判断失败。\n' >&2; exit 1; }
 if policer_candidate_is_clean 800 0 1000 0; then printf '限速器送达率判断失败。\n' >&2; exit 1; fi
