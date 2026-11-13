@@ -20,6 +20,10 @@ if ($content -notmatch "AUTO_TARGET_RTT_MS='150'") { throw 'Missing cross-region
 if ($content -match 'RTT_MS=\$MEASURE_RTT') { throw 'Do not use a near measurement peer RTT as the BDP target RTT.' }
 if ($content -notmatch 'calculate_initial_rmem') { throw 'Missing role-aware TCP receive buffer calculation.' }
 if ($content -notmatch 'calculate_initial_wmem') { throw 'Missing role-aware TCP send buffer calculation.' }
+foreach ($lossRecoveryKey in @('tcp_sack', 'tcp_dsack', 'tcp_timestamps', 'tcp_no_metrics_save')) {
+    if ($content -notmatch "add_setting net\.ipv4\.$lossRecoveryKey") { throw "Missing managed loss-recovery baseline: $lossRecoveryKey" }
+}
+if ($content -notmatch 'add_setting net\.core\.netdev_budget 600') { throw 'Missing bounded softnet processing budget.' }
 if ($content -match 'add_setting net\.core\.(rmem_default|wmem_default)') { throw 'TCP defaults must not alter global socket defaults.' }
 if ($content -notmatch 'restore_legacy_core_defaults') { throw 'Missing v3.6.0 global default migration.' }
 if ($content -notmatch 'RETRANS_PER_GIB_HARD_LIMIT') { throw 'Missing transfer-normalized retransmission guard.' }
@@ -47,7 +51,10 @@ if ($content -notmatch 'SHAPE_SCRIPT_MARKER') { throw 'Persistent shaping script
 if ($content -notmatch 'SHAPE_UNIT_MARKER') { throw 'Persistent shaping unit needs an ownership marker.' }
 if ($content -notmatch 'validate_iface') { throw 'Interface names must be validated before persistence.' }
 if ($content -notmatch '部分 sysctl 恢复失败；配置和快照均已保留') { throw 'Rollback must retain evidence after partial restore failure.' }
-if ($installContent -notmatch "readonly VERSION='6\.1\.0'") { throw 'Installer version is stale.' }
+if ($content -notmatch 'find_sysctl_conflicts') { throw 'Missing persistent sysctl conflict detection.' }
+if ($content -notmatch 'verify_built_settings') { throw 'Missing live sysctl read-back verification.' }
+if ($content -notmatch 'CONFIG_TRANSACTION_FILE') { throw 'Missing managed-config transaction backup.' }
+if ($installContent -notmatch "readonly VERSION='6\.3\.0'") { throw 'Installer version is stale.' }
 if ($installContent -match "EXPECTED_SHA256='TO_BE_REPLACED'") { throw 'Installer checksum placeholder was not replaced.' }
 if ($installContent -notmatch '--local') { throw 'Installer needs an offline/local verified path.' }
 $expectedMatch = [regex]::Match($installContent, "EXPECTED_SHA256='([0-9a-f]{64})'")

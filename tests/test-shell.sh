@@ -27,15 +27,16 @@ export ALLOW_HIGH_TRAFFIC=1
 guard_test_traffic '测试流量护栏' 10000 3 >/dev/null 2>&1 || { printf '显式高流量授权未生效。\n' >&2; exit 1; }
 export MAX_TEST_GIB=20 ALLOW_HIGH_TRAFFIC=0
 
-parse_options --peer-max-rtt 80 --max-test-gib 5 --max-rate-spread 35 --allow-public-peers --allow-high-traffic --forward-only --experiment-qdisc
+parse_options --peer-max-rtt 80 --max-test-gib 5 --max-rate-spread 35 --allow-public-peers --allow-high-traffic --allow-sysctl-conflicts --forward-only --experiment-qdisc
 assert_equals 80 "$PEER_MAX_RTT" '公共节点 RTT 参数解析'
 assert_equals 5 "$MAX_TEST_GIB" '流量上限参数解析'
 assert_equals 35 "$MAX_RATE_SPREAD_PERCENT" '多轮波动阈值参数解析'
 assert_equals 1 "$ALLOW_PUBLIC_PEERS" '公共节点显式授权参数解析'
 assert_equals 1 "$ALLOW_HIGH_TRAFFIC" '高流量显式授权参数解析'
+assert_equals 1 "$ALLOW_SYSCTL_CONFLICTS" 'sysctl 冲突显式授权参数解析'
 assert_equals 0 "$BIDIRECTIONAL" '仅出站参数解析'
 assert_equals 1 "$QDISC_EXPERIMENT" '活动 qdisc 实验参数解析'
-export PEER_MAX_RTT=120 MAX_TEST_GIB=20 MAX_RATE_SPREAD_PERCENT=40 ALLOW_PUBLIC_PEERS=0 ALLOW_HIGH_TRAFFIC=0 BIDIRECTIONAL=1 QDISC_EXPERIMENT=0
+export PEER_MAX_RTT=120 MAX_TEST_GIB=20 MAX_RATE_SPREAD_PERCENT=40 ALLOW_PUBLIC_PEERS=0 ALLOW_HIGH_TRAFFIC=0 ALLOW_SYSCTL_CONFLICTS=0 BIDIRECTIONAL=1 QDISC_EXPERIMENT=0
 
 export BANDWIDTH_MBIT=284
 memory_mib() { printf 2048; }
@@ -50,7 +51,23 @@ getconf() { printf 65536; }
 assert_equals '2048 4096 8192' "$(calculate_tcp_mem)" '64KiB 页大小的 TCP 内存预算'
 unset -f getconf
 assert_equals 1048576 "$(calculate_initial_rmem "$(calculate_buffer)")" '代理初始接收缓冲区'
-assert_equals 262144 "$(calculate_initial_wmem "$(calculate_buffer)")" '代理初始发送缓冲区'
+assert_equals 1048576 "$(calculate_initial_wmem "$(calculate_buffer)")" '代理初始发送缓冲区'
+assert_equals 16384 "$(calculate_backlog)" '常规带宽软中断积压队列'
+assert_equals 32768 "$(BANDWIDTH_MBIT=5000 calculate_backlog)" '五千兆以上软中断积压队列'
+
+sysctl_exists() { return 0; }
+build_settings
+setting_value() {
+  local wanted=$1 index
+  for index in "${!KEYS[@]}"; do [[ ${KEYS[$index]} == "$wanted" ]] && { printf '%s' "${VALUES[$index]}"; return 0; }; done
+  return 1
+}
+assert_equals 1 "$(setting_value net.ipv4.tcp_sack)" '显式恢复 SACK'
+assert_equals 1 "$(setting_value net.ipv4.tcp_dsack)" '显式恢复 DSACK'
+assert_equals 1 "$(setting_value net.ipv4.tcp_timestamps)" '显式恢复 TCP timestamps'
+assert_equals 0 "$(setting_value net.ipv4.tcp_no_metrics_save)" '恢复 TCP 路由指标缓存'
+assert_equals 600 "$(setting_value net.core.netdev_budget)" '提高软中断单轮预算'
+unset -f sysctl_exists setting_value
 export ROLE=general
 
 parse_iperf_result '[SUM]   0.00-10.00  sec  1.10 GBytes   944 Mbits/sec    3             sender
@@ -158,5 +175,37 @@ if ! is_material_regression 100 1000 80 1000; then printf '吞吐退化回滚判
 candidate_retrans_is_acceptable 1000 2500 || { printf '相对基线重传边界被错误拒绝。\n' >&2; exit 1; }
 if candidate_retrans_is_acceptable 1000 2501; then printf '超过相对基线重传边界的候选被错误接受。\n' >&2; exit 1; fi
 candidate_retrans_is_acceptable 30000 60000 || { printf '高损耗基线的相对候选被错误拒绝。\n' >&2; exit 1; }
+
+assert_equals '4096 131072 4194304' "$(normalize_sysctl_value $'4096\t131072   4194304')" 'sysctl 值空白规范化'
+
+conflict_dir=$(mktemp -d)
+printf '%s\n' 'net.ipv4.tcp_congestion_control = cubic' 'net.ipv4.ip_forward = 1' >"$conflict_dir/50-old.conf"
+printf '%s\n' 'net.core.default_qdisc=fq_codel' >"$conflict_dir/99-other.conf"
+SYSCTL_CONFIG_FILES_OVERRIDE=$(printf '%s\n%s' "$conflict_dir/50-old.conf" "$conflict_dir/99-other.conf")
+conflicts=$(find_sysctl_conflicts net.ipv4.tcp_congestion_control net.core.default_qdisc)
+[[ $conflicts == *$'50-old.conf\tnet.ipv4.tcp_congestion_control\tcubic'* ]] || { printf '未检测到拥塞算法配置冲突。\n' >&2; exit 1; }
+[[ $conflicts == *$'99-other.conf\tnet.core.default_qdisc\tfq_codel'* ]] || { printf '未检测到 qdisc 配置冲突。\n' >&2; exit 1; }
+report_sysctl_conflicts net.ipv4.tcp_congestion_control net.core.default_qdisc >/dev/null 2>&1 || { printf '排序更早的 sysctl 文件被错误阻断。\n' >&2; exit 1; }
+printf '%s\n' 'net.core.default_qdisc = cake' >"$conflict_dir/zz-after.conf"
+SYSCTL_CONFIG_FILES_OVERRIDE+=$'\n'"$conflict_dir/zz-after.conf"
+if report_sysctl_conflicts net.core.default_qdisc >/dev/null 2>&1; then printf '排序更晚的 sysctl 文件未被阻断。\n' >&2; exit 1; fi
+ALLOW_SYSCTL_CONFLICTS=1
+report_sysctl_conflicts net.core.default_qdisc >/dev/null 2>&1 || { printf '显式授权未放行排序更晚的 sysctl 文件。\n' >&2; exit 1; }
+ALLOW_SYSCTL_CONFLICTS=0
+unset SYSCTL_CONFIG_FILES_OVERRIDE
+rm -rf "$conflict_dir"
+
+sysctl() {
+  if [[ $1 == -n ]]; then
+    case "$2" in one) printf '1\n' ;; two) printf '2  3\n' ;; *) return 1 ;; esac
+  elif [[ $1 == -aN ]]; then printf 'one\ntwo\n';
+  else return 1
+  fi
+}
+KEYS=(one two); VALUES=(1 '2 3')
+verify_built_settings || { printf '正确写入值未通过读回验证。\n' >&2; exit 1; }
+VALUES=(1 '2 4')
+if verify_built_settings >/dev/null 2>&1; then printf '错误写入值未被读回验证发现。\n' >&2; exit 1; fi
+unset -f sysctl
 
 printf 'Shell 功能测试通过。\n'

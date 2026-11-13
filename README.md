@@ -1,6 +1,6 @@
 # VPS TCP 自适应调优器
 
-给 Linux VPS 使用的 TCP 调优脚本。可以直接按套餐带宽和业务 RTT 应用 BBR、活动 FQ 和自适应 TCP 缓冲区，不再把 iperf3 稳定性当成调优前置门槛；深度模式仍可实测择优并在退化时自动恢复。
+给 Linux VPS 使用的 TCP 调优脚本。可以直接按套餐带宽和业务 RTT 应用 BBR、活动 FQ、自适应 TCP 缓冲区及标准丢包恢复能力，不再把 iperf3 稳定性当成调优前置门槛；深度模式仍可实测择优并在退化时自动恢复。
 
 > 调优不能修复差线路、晚高峰拥堵或商家限速。建议先在非关键 VPS 上测试。
 
@@ -11,7 +11,7 @@
 SSH 登录 VPS 后，复制下面两行执行：
 
 ```bash
-curl -fLO https://github.com/elonjack/vps-tcp-safe-tuner/releases/download/v6.1.0/install.sh
+curl -fLO https://github.com/elonjack/vps-tcp-safe-tuner/releases/download/v6.3.0/install.sh
 bash install.sh
 ```
 
@@ -42,7 +42,7 @@ sudo vps-tcp-tune
 3. 基础调优会自动按 `150ms` 跨境目标 RTT 推导，不用再回答 RTT 问题。
 4. 脚本显示修改计划后，确认无误输入 `y`。
 
-这条路径不需要 iperf3，会直接完成“精确快照 → BBR + 活动 FQ → 自适应缓冲区 → 持久化”。不满意可用菜单 `6` 精确回滚。
+这条路径不需要 iperf3，会直接完成“精确快照 → BBR + 活动 FQ → 自适应缓冲区 → SACK/DSACK/timestamps 丢包恢复基线 → 持久化”。不满意可用菜单 `6` 精确回滚。
 
 如果不知道套餐带宽，第一问可直接回车，脚本才会进入 iperf3 自动测速模式。
 
@@ -104,7 +104,9 @@ sudo vps-tcp-tune tune --bandwidth 3000 --role proxy
 
 `tune` 同时设置 `initcwnd/initrwnd=32`，原值会保存。用 `--initcwnd 0` 可跳过窗口调整。systemd 恢复服务每 30 秒检查一次，在同一网卡重连、DHCP 更新或重启后补回受管 FQ 和窗口；回滚时先停服务，再恢复原窗口值，沿用当前网关。仅支持单一 IPv4 默认路由，不覆盖策略路由和多路径路由。
 
-TCP 内存预算按真实页大小推导为总内存的 1/16、1/8、1/4；单 socket 上限采用 2×BDP + 2MiB，并受内存 1/32 与 256MiB 约束。上限并非预分配。Linux 6.6 起废弃的 `tcp_adv_win_scale` 不作为有效调优项写入。
+TCP 内存预算按真实页大小推导为总内存的 1/16、1/8、1/4；单 socket 上限采用 2×BDP + 2MiB，并受内存 1/32 与 256MiB 约束。代理和通用角色以 1MiB 作为 TCP 收发缓冲起点，避免 200ms 级路径从很小的发送窗口慢慢爬升；总量仍受 `tcp_mem` 约束。Linux 6.6 起废弃的 `tcp_adv_win_scale` 不作为有效调优项写入。
+
+脚本会显式恢复 Linux 默认启用的 `tcp_sack=1`、`tcp_dsack=1`、`tcp_timestamps=1`，并恢复 `tcp_no_metrics_save=0`。这不是激进参数：它主要修复机器曾被其它调优脚本关闭这些标准能力后，近端零丢包测速正常、国内高延迟有损单线程却只有几 Mbps 的异常状态。所有值都会进入快照、冲突检测、读回验证和回滚。
 
 如果还要自动扫描并验证整形，指定可信近端 iperf3 对端：
 
@@ -137,6 +139,9 @@ sudo vps-tcp-tune tune --bandwidth 3000 --role proxy \
 - `--allow-public-peers` 表示允许连接内置第三方 iperf3 节点；对端会看到 VPS 的公网 IP。
 - 脚本不会修改防火墙、SSH、swap，也不会下载新内核。`tune` 会调整单一 IPv4 默认路由的初始窗口，保留当前网关及其它路由属性；多出口、IPv6-only 和特殊路由会跳过该项。
 - 一键/标准模式会在保存精确快照后应用活动 FQ；遇到无法精确恢复的特殊 qdisc 会拒绝修改。深度模式会先 A/B，未达择优门槛就恢复原队列。
+- 应用前会扫描其它持久化 sysctl 文件：较早加载的重复项会提示，可能在本工具之后覆盖运行值的文件会阻断。只有审阅后才能用 `--allow-sysctl-conflicts` 显式放行阻断项。
+- 写入后会逐项读回内核运行值；持久化文件还会重新加载验证。`status` 会报告配置与运行值漂移，不把“文件存在”误当成“调优生效”。
+- 会管理 SACK、DSACK、TCP timestamps、路由指标缓存与有限的 softnet 预算；若旧配置文件也设置这些键，会按同一冲突规则提示或阻断。
 - OpenVZ/LXC 可能禁止 BBR、sysctl 或 qdisc，遇到限制时脚本会停止，不会强行修改。
 
 ## 使用自己的测速服务器
@@ -213,6 +218,7 @@ sudo vps-tcp-tune unshape
 - 主脚本不会下载并执行远程代码。
 - 公共测速节点和高流量测试分别需要明确授权。
 - 首次修改前保存 sysctl 精确快照；本次实验另有事务快照。
+- 事务同时保护受管 sysctl 配置文件；加载或读回失败时恢复旧文件，不留下重启才生效的半成品。
 - 持久化文件使用原子写入和所有权标记，不覆盖同名第三方文件。
 - 写入 systemd 脚本前严格校验网卡名，整形服务限制文件系统权限和 capability。
 - 自动/深度模式会使用同一对端复测；明显退化或无法完成验证时默认恢复。

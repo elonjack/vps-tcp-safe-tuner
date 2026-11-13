@@ -6,10 +6,12 @@ set -Eeuo pipefail
 IFS=$'\n\t'
 umask 077
 
-readonly VERSION='6.1.0'
+readonly VERSION='6.3.0'
 readonly STATE_DIR='/var/lib/vps-tcp-safe-tuner'
 readonly SNAPSHOT_FILE="$STATE_DIR/baseline.tsv"
 readonly TRANSACTION_FILE="$STATE_DIR/transaction.tsv"
+readonly CONFIG_TRANSACTION_FILE="$STATE_DIR/config.before"
+readonly CONFIG_TRANSACTION_ABSENT="$STATE_DIR/config.before.absent"
 readonly FACTS_FILE="$STATE_DIR/facts.tsv"
 readonly CONFIG_FILE='/etc/sysctl.d/99-vps-tcp-safe-tuner.conf'
 readonly LOCK_FILE='/run/lock/vps-tcp-safe-tuner.lock'
@@ -35,6 +37,8 @@ readonly RETRANS_RELATIVE_MULTIPLIER='3'
 
 COMMAND='menu'; ROLE='general'; PEER=''; PEER_PORT='5201'; BANDWIDTH_MBIT=''; RTT_MS=''
 DURATION='12'; WORKERS='4'; ROUNDS='3'; POLICER_ROUNDS='3'; PEER_MAX_RTT='120'; MAX_TEST_GIB='20'; MAX_RATE_SPREAD_PERCENT='40'; BUFFER_MULTIPLIER_OVERRIDE=''; SHAPE_RATE=''; ENABLE_SHAPING=0; BUFFER_SEARCH=0; QDISC_EXPERIMENT=0; DRY_RUN=0; ASSUME_YES=0; NO_INSTALL=0; KEEP_ON_REGRESSION=0; ALLOW_PUBLIC_PEERS=0; ALLOW_HIGH_TRAFFIC=0; BIDIRECTIONAL=1
+ALLOW_SYSCTL_CONFLICTS=0
+SYSCTL_CONFLICT_COUNT=0; SYSCTL_BLOCKING_CONFLICT_COUNT=0
 TUNING_APPLIED=0; DEFER_PERSIST=0; BBR_MODULE_CONFIG_CREATED=0
 QDISC_SELECTED_FQ=0; QDISC_CHANGED=0; QDISC_ORIGINAL_IFACE=''; QDISC_ORIGINAL_KIND=''; QDISC_ORIGINAL_SPEC=''; QDISC_BACKUP_FILE=''
 NOISY_LINK=0
@@ -63,6 +67,14 @@ speedtest.nyc1.us.leaseweb.net|纽约|Leaseweb
 speedtest.mia11.us.leaseweb.net|迈阿密|Leaseweb
 speedtest.mtl2.ca.leaseweb.net|蒙特利尔|Leaseweb'
 readonly -a IPERF_PORTS=(5201 5202 5203 5204 5205 5206 5207 5208 5209 5210 5200)
+readonly -a MANAGED_SYSCTL_KEYS=(
+  net.ipv4.tcp_congestion_control net.core.default_qdisc
+  net.core.rmem_max net.core.wmem_max net.ipv4.tcp_rmem net.ipv4.tcp_wmem net.ipv4.tcp_mem
+  net.ipv4.tcp_window_scaling net.ipv4.tcp_moderate_rcvbuf net.ipv4.tcp_mtu_probing
+  net.ipv4.tcp_sack net.ipv4.tcp_dsack net.ipv4.tcp_timestamps net.ipv4.tcp_no_metrics_save
+  net.ipv4.tcp_slow_start_after_idle net.core.netdev_max_backlog net.core.netdev_budget net.core.somaxconn
+  net.ipv4.tcp_max_syn_backlog net.ipv4.ip_local_port_range
+)
 
 yellow() { if [[ -t 1 ]]; then printf '\033[1;33m%s\033[0m' "$*"; else printf '%s' "$*"; fi; }
 say() { yellow "[信息] $*"; printf '\n'; }
@@ -111,6 +123,7 @@ vps-tcp-tune - 自适应 Linux VPS TCP 调优工具
   --shape-rate MBIT    shape 使用的目标速率
   --no-install         不允许脚本安装 iperf3
   --keep-on-regression 即使复测明显退化，也不自动回滚（默认会回滚）
+  --allow-sysctl-conflicts 允许与其它 sysctl 文件管理相同参数（默认拒绝）
   --dry-run            仅显示动作，不写入系统
   --yes                非交互确认（整形仍要求 --enable-shaping）
 
@@ -158,6 +171,87 @@ sysctl_exists() {
   names=$(sysctl -aN 2>/dev/null || true)
   [[ $'\n'$names$'\n' == *$'\n'"$1"$'\n'* ]]
 }
+normalize_sysctl_value() { awk '{$1=$1; print}' <<<"$1"; }
+
+# 列出会与本工具争用同一参数的持久化配置。这里只报告，不修改第三方文件。
+sysctl_config_files() {
+  local directory path resolved
+  local -A seen=()
+  if [[ -f /etc/sysctl.conf ]]; then
+    resolved=$(readlink -f -- /etc/sysctl.conf 2>/dev/null || printf '%s' /etc/sysctl.conf)
+    seen[$resolved]=1
+    printf '%s\n' /etc/sysctl.conf
+  fi
+  for directory in /etc/sysctl.d /run/sysctl.d /usr/local/lib/sysctl.d /usr/lib/sysctl.d /lib/sysctl.d; do
+    [[ -d $directory ]] || continue
+    while IFS= read -r path; do
+      resolved=$(readlink -f -- "$path" 2>/dev/null || printf '%s' "$path")
+      [[ -n ${seen[$resolved]:-} ]] && continue
+      seen[$resolved]=1
+      printf '%s\n' "$path"
+    done < <(find "$directory" -maxdepth 1 \( -type f -o -type l \) -name '*.conf' -print 2>/dev/null | sort)
+  done
+}
+
+sysctl_key_is_managed() {
+  local candidate=$1 wanted
+  shift
+  for wanted in "$@"; do [[ $candidate == "$wanted" ]] && return 0; done
+  return 1
+}
+
+find_sysctl_conflicts() {
+  local file raw line key value
+  local -a wanted=("$@") files=()
+  ((${#wanted[@]})) || return 0
+  if [[ -n ${SYSCTL_CONFIG_FILES_OVERRIDE:-} ]]; then
+    while IFS= read -r file; do [[ -n $file ]] && files+=("$file"); done <<<"$SYSCTL_CONFIG_FILES_OVERRIDE"
+  else
+    while IFS= read -r file; do files+=("$file"); done < <(sysctl_config_files)
+  fi
+  for file in "${files[@]}"; do
+    [[ $file == "$CONFIG_FILE" || ! -r $file ]] && continue
+    while IFS= read -r raw || [[ -n $raw ]]; do
+      line=${raw%%#*}; line=${line%%;*}
+      [[ $line == *=* ]] || continue
+      key=${line%%=*}; value=${line#*=}
+      key=$(normalize_sysctl_value "$key"); key=${key#-}; key=${key//\//.}
+      sysctl_key_is_managed "$key" "${wanted[@]}" || continue
+      value=$(normalize_sysctl_value "$value")
+      printf '%s\t%s\t%s\n' "$file" "$key" "$value"
+    done <"$file"
+  done
+}
+
+report_sysctl_conflicts() {
+  local conflicts file key value basename managed_basename blocking=0
+  SYSCTL_CONFLICT_COUNT=0; SYSCTL_BLOCKING_CONFLICT_COUNT=0
+  conflicts=$(find_sysctl_conflicts "$@")
+  [[ -n $conflicts ]] || return 0
+  managed_basename=${CONFIG_FILE##*/}
+  warn '检测到其它持久化 sysctl 文件也在管理本次参数：'
+  while IFS=$'\t' read -r file key value; do
+    SYSCTL_CONFLICT_COUNT=$(( SYSCTL_CONFLICT_COUNT + 1 ))
+    basename=${file##*/}
+    # 同名文件由 /etc 版本优先；更早的文件会被本工具 99-vps... 明确覆盖。
+    # /etc/sysctl.conf 及文件名排序更晚的配置可能在启动时重新覆盖本工具。
+    if [[ $file == /etc/sysctl.conf || $basename > "$managed_basename" ]]; then
+      warn "  [阻断] $file: $key = $value"
+      SYSCTL_BLOCKING_CONFLICT_COUNT=$(( SYSCTL_BLOCKING_CONFLICT_COUNT + 1 ))
+      blocking=1
+    else
+      warn "  [较早/被覆盖] $file: $key = $value"
+    fi
+  done <<<"$conflicts"
+  (( blocking )) || { warn '这些配置的文件名排序早于本工具；本工具会覆盖相同键，但卸载后它们可能重新生效。'; return 0; }
+  if (( ALLOW_SYSCTL_CONFLICTS )); then
+    warn '阻断冲突已由 --allow-sysctl-conflicts 明确放行；应用后仍会逐项加载并读回验证。'
+    return 0
+  fi
+  warn '存在会在本工具之后加载的配置；为避免重启后改变结果，默认拒绝继续。请先合并/停用阻断文件，或审阅后显式使用 --allow-sysctl-conflicts。'
+  return 1
+}
+
 kernel_supports_bbr() { [[ " $(sysctl_value net.ipv4.tcp_available_congestion_control) " == *' bbr '* ]]; }
 write_bbr_module_config() {
   local temporary_file
@@ -483,27 +577,29 @@ calculate_tcp_mem() {
 }
 calculate_initial_rmem() {
   local ceiling=$1 initial
-  # TCP 接收初始窗口可加快代理请求和首包交换；上限仍由 BDP 和内存限制。
+  # 高 BDP 单流从过小的初始缓冲起步会浪费多个 RTT。1MiB 与 tcpfit 的
+  # proxy 起点一致；全局 tcp_mem 压力阈值仍限制总内存，并非每条连接预分配上限。
   case "$ROLE" in
     proxy) initial=1048576 ;;
     server) initial=524288 ;;
-    *) initial=131072 ;;
+    *) initial=1048576 ;;
   esac
   (( initial > ceiling )) && initial=$ceiling
   printf '%s' "$initial"
 }
 calculate_initial_wmem() {
   local ceiling=$1 initial
-  # 发送初始缓冲不宜与接收窗口同样激进；过大会让代理响应在本机堆积。
+  # 代理/通用单流使用 1MiB 起点，避免 200ms 级路径从 16/256KiB 慢慢爬升。
+  # server 角色保持较保守；所有角色仍受单 socket 上限与 tcp_mem 总预算约束。
   case "$ROLE" in
-    proxy) initial=262144 ;;
-    server) initial=65536 ;;
-    *) initial=16384 ;;
+    proxy) initial=1048576 ;;
+    server) initial=262144 ;;
+    *) initial=1048576 ;;
   esac
   (( initial > ceiling )) && initial=$ceiling
   printf '%s' "$initial"
 }
-calculate_backlog() { if (( BANDWIDTH_MBIT >= 5000 )); then printf 20000; elif (( BANDWIDTH_MBIT >= 1000 )); then printf 10000; elif (( BANDWIDTH_MBIT >= 200 )); then printf 5000; else printf 2500; fi; }
+calculate_backlog() { if (( BANDWIDTH_MBIT >= 5000 )); then printf 32768; else printf 16384; fi; }
 
 declare -a KEYS=() VALUES=()
 add_setting() { sysctl_exists "$1" || { warn "内核不支持 $1，已跳过。"; return 0; }; KEYS+=("$1"); VALUES+=("$2"); }
@@ -537,8 +633,14 @@ build_settings() {
   add_setting net.ipv4.tcp_rmem "4096 $initial_rmem $buffer"; add_setting net.ipv4.tcp_wmem "4096 $initial_wmem $buffer"
   add_setting net.ipv4.tcp_mem "$(calculate_tcp_mem)"
   add_setting net.ipv4.tcp_window_scaling 1; add_setting net.ipv4.tcp_moderate_rcvbuf 1
+  # 修复其它“优化脚本”最常留下的有损链路退化项。SACK/DSACK/timestamps 都是
+  # Linux 默认开启的标准能力；显式恢复后，旧配置把它们关掉也不会让跨境单流
+  # 在少量丢包下退回到超时恢复。tcp_no_metrics_save=0 同样恢复内核默认行为。
+  add_setting net.ipv4.tcp_sack 1; add_setting net.ipv4.tcp_dsack 1
+  add_setting net.ipv4.tcp_timestamps 1; add_setting net.ipv4.tcp_no_metrics_save 0
   add_setting net.ipv4.tcp_mtu_probing 1; add_setting net.ipv4.tcp_slow_start_after_idle 0
-  add_setting net.core.netdev_max_backlog "$backlog"; add_setting net.core.somaxconn "$socket_queue"; add_setting net.ipv4.tcp_max_syn_backlog "$syn_queue"
+  add_setting net.core.netdev_max_backlog "$backlog"; add_setting net.core.netdev_budget 600
+  add_setting net.core.somaxconn "$socket_queue"; add_setting net.ipv4.tcp_max_syn_backlog "$syn_queue"
   [[ $ROLE != proxy ]] || add_setting net.ipv4.ip_local_port_range '10240 65535'
   ((${#KEYS[@]})) || fail '没有可写入的调优项。'
 }
@@ -546,9 +648,14 @@ build_settings() {
 active_root_qdisc() { tc qdisc show dev "$1" 2>/dev/null | awk 'NR == 1 {print $2}'; }
 active_htb_rate() { tc class show dev "$1" 2>/dev/null | awk '{for (i = 1; i <= NF; i += 1) if ($i == "rate") {print $(i + 1); exit}}'; }
 show_environment() {
-  local iface root_qdisc htb_rate
+  local iface root_qdisc htb_rate sack dsack timestamps
   iface=$(default_interface); line; say "版本：$VERSION；内核：$(uname -r)；虚拟化：$(virtualization)"
   say "内存：$(memory_mib) MiB；默认网卡：${iface:-未检测到}"; say "拥塞控制：$(sysctl_value net.ipv4.tcp_congestion_control)；默认 qdisc：$(sysctl_value net.core.default_qdisc)"
+  sack=$(sysctl_value net.ipv4.tcp_sack); dsack=$(sysctl_value net.ipv4.tcp_dsack); timestamps=$(sysctl_value net.ipv4.tcp_timestamps)
+  say "丢包恢复：SACK=${sack:-不支持}；DSACK=${dsack:-不支持}；timestamps=${timestamps:-不支持}"
+  if [[ $sack == 0 || $dsack == 0 || $timestamps == 0 ]]; then
+    warn '检测到标准 TCP 丢包恢复能力被关闭；这会让高延迟、有少量丢包的单线程吞吐严重下降。'
+  fi
   if [[ -n $iface ]]; then
     root_qdisc=$(active_root_qdisc "$iface")
     say "活动根 qdisc：${root_qdisc:-未检测到}"
@@ -563,6 +670,7 @@ show_plan() {
   local i buffer initial_rmem initial_wmem; buffer=$(calculate_buffer); initial_rmem=$(calculate_initial_rmem "$buffer"); initial_wmem=$(calculate_initial_wmem "$buffer"); show_environment
   say "用途=$ROLE；带宽=${BANDWIDTH_MBIT} Mbit/s；业务目标 RTT=${RTT_MS} ms；推导缓冲区上限=${buffer} 字节；初始接收/发送缓冲区=${initial_rmem}/${initial_wmem} 字节。"
   say '缓冲区采用 BDP 倍率 + 2MiB 余量；单 socket 上限受内存 1/32 及 256MiB 约束。'
+  say '将显式恢复 SACK、DSACK、TCP timestamps 与路由指标缓存，防止旧调优配置拖垮高延迟有损单流。'
   for i in "${!KEYS[@]}"; do say "${KEYS[$i]}：$(sysctl_value "${KEYS[$i]}") -> ${VALUES[$i]}"; done
   if (( QDISC_EXPERIMENT )); then say '基础候选先保持原活动 qdisc；深度阶段会临时 A/B 测试 FQ，未胜出即精确恢复。'
   else say '将把默认 qdisc 设为 fq，并在精确保存当前活动队列后切换为 FQ；回滚会恢复原队列。'; fi
@@ -589,6 +697,22 @@ snapshot_transaction() {
   for i in "${!KEYS[@]}"; do printf '%s\t%s\n' "${KEYS[$i]}" "$(sysctl_value "${KEYS[$i]}")" >>"$tmp"; done
   mv -f "$tmp" "$TRANSACTION_FILE"
 }
+snapshot_config_transaction() {
+  rm -f "$CONFIG_TRANSACTION_FILE" "$CONFIG_TRANSACTION_ABSENT"
+  if [[ -f $CONFIG_FILE ]]; then
+    cp -p -- "$CONFIG_FILE" "$CONFIG_TRANSACTION_FILE"
+  else
+    : >"$CONFIG_TRANSACTION_ABSENT"
+    chmod 600 "$CONFIG_TRANSACTION_ABSENT"
+  fi
+}
+restore_config_transaction() {
+  if [[ -f $CONFIG_TRANSACTION_FILE ]]; then
+    mv -f -- "$CONFIG_TRANSACTION_FILE" "$CONFIG_FILE"
+  elif [[ -f $CONFIG_TRANSACTION_ABSENT ]]; then
+    rm -f -- "$CONFIG_FILE" "$CONFIG_TRANSACTION_ABSENT"
+  fi
+}
 restore_transaction_values() {
   local key value failed=0
   [[ -f $TRANSACTION_FILE ]] || return 0
@@ -601,10 +725,13 @@ restore_transaction_values() {
   done <"$TRANSACTION_FILE"
   return "$failed"
 }
-discard_transaction() { rm -f "$TRANSACTION_FILE"; }
+discard_transaction() { rm -f "$TRANSACTION_FILE" "$CONFIG_TRANSACTION_FILE" "$CONFIG_TRANSACTION_ABSENT"; }
 abort_transaction() {
   cleanup_candidate_bbr
-  if restore_transaction_values; then
+  local failed=0
+  restore_config_transaction || failed=1
+  restore_transaction_values || failed=1
+  if (( failed == 0 )); then
     discard_transaction
     return 0
   fi
@@ -736,10 +863,47 @@ apply_built_settings() {
     sysctl -q -w "${KEYS[$index]}=${VALUES[$index]}" || return 1
   done
 }
+verify_built_settings() {
+  local index current expected failed=0
+  for index in "${!KEYS[@]}"; do
+    current=$(normalize_sysctl_value "$(sysctl_value "${KEYS[$index]}")")
+    expected=$(normalize_sysctl_value "${VALUES[$index]}")
+    if [[ $current != "$expected" ]]; then
+      warn "参数读回不一致：${KEYS[$index]}，期望 '$expected'，实际 '${current:-<空>}'。"
+      failed=1
+    fi
+  done
+  return "$failed"
+}
+load_and_verify_config() {
+  sysctl -p "$CONFIG_FILE" >/dev/null || return 1
+  verify_built_settings
+}
+verify_managed_config_live() {
+  local raw line key expected current failed=0 checked=0
+  [[ -f $CONFIG_FILE ]] || return 1
+  while IFS= read -r raw || [[ -n $raw ]]; do
+    line=${raw%%#*}; [[ $line == *=* ]] || continue
+    key=$(normalize_sysctl_value "${line%%=*}")
+    expected=$(normalize_sysctl_value "${line#*=}")
+    current=$(normalize_sysctl_value "$(sysctl_value "$key")")
+    checked=$(( checked + 1 ))
+    if [[ $current != "$expected" ]]; then
+      warn "运行值漂移：$key，配置 '$expected'，实际 '${current:-<空>}'。"
+      failed=1
+    fi
+  done <"$CONFIG_FILE"
+  (( checked > 0 )) || return 1
+  return "$failed"
+}
 apply_tuning() {
   TUNING_APPLIED=0
   (( QDISC_EXPERIMENT == 0 || DEFER_PERSIST == 1 )) || fail '--experiment-qdisc 只能配合 auto/deep 使用，不能配合 apply。'
-  require_root; require_linux; require_command sysctl; require_command ip; require_command tc; lock; validate_common; derive_network_facts; build_settings; show_plan
+  require_root; require_linux; require_command sysctl; require_command ip; require_command tc; lock; validate_common
+  [[ ! -e $TRANSACTION_FILE && ! -e $CONFIG_TRANSACTION_FILE && ! -e $CONFIG_TRANSACTION_ABSENT ]] || fail '检测到未完成事务；请先执行 rollback 或检查事务快照。'
+  derive_network_facts; build_settings
+  report_sysctl_conflicts "${KEYS[@]}" || fail '存在未处理的 sysctl 配置冲突，未修改系统。'
+  show_plan
   (( DRY_RUN )) && { ok '预览完成，未修改系统。'; return 0; }
   if (( QDISC_EXPERIMENT )); then
     confirm '将启用内核已有的 BBR、临时应用候选 sysctl，并在保存精确快照后进行缓冲区及活动 FQ 队列 A/B 实验。继续吗？' || { say '已取消。'; return 0; }
@@ -749,6 +913,7 @@ apply_tuning() {
   ensure_bbr
   snapshot_if_needed
   snapshot_transaction
+  snapshot_config_transaction
   if ! restore_legacy_core_defaults; then
     warn '旧版全局 socket 默认值恢复失败，正在恢复本次应用前参数。'
     abort_transaction || fail '调优失败，且部分参数未能恢复；事务快照已保留。'
@@ -759,6 +924,11 @@ apply_tuning() {
     abort_transaction || fail '调优失败，且部分参数未能恢复；事务快照已保留。'
     fail '调优失败，已恢复本次应用前参数。'
   fi
+  if ! verify_built_settings; then
+    warn '候选 sysctl 写入后读回不一致，正在恢复本次应用前参数。'
+    abort_transaction || fail '读回验证失败，且部分参数未能恢复；事务快照已保留。'
+    fail '读回验证失败，已恢复本次应用前参数。'
+  fi
   if (( QDISC_EXPERIMENT == 0 )) && ! apply_managed_fq; then
     warn '活动 FQ 应用失败，正在恢复本次应用前参数。'
     restore_qdisc_experiment >/dev/null 2>&1 || true
@@ -768,7 +938,7 @@ apply_tuning() {
   if (( DEFER_PERSIST )); then
     TUNING_APPLIED=1; ok "已临时应用 ${#KEYS[@]} 项候选 TCP 设置及可恢复的活动 FQ，复测通过后才会持久化。"
   else
-    if ! persist_qdisc_tune_state || ! write_facts || ! write_config; then
+    if ! persist_qdisc_tune_state || ! write_facts || ! write_config || ! load_and_verify_config; then
       warn '持久化文件写入失败，正在恢复本次应用前参数。'
       restore_qdisc_experiment || warn '活动 qdisc 未能自动恢复；队列快照已保留。'
       abort_transaction || fail '持久化失败，且部分参数未能恢复；事务快照已保留。'
@@ -776,7 +946,7 @@ apply_tuning() {
     fi
     discard_transaction; TUNING_APPLIED=1
     write_runtime_service || warn '网络恢复服务安装失败；当前配置有效，重启恢复尚未完成。'
-    ok "已应用 ${#KEYS[@]} 项自适应 TCP 设置。"
+    ok "已应用并逐项读回验证 ${#KEYS[@]} 项自适应 TCP 设置。"
   fi
 }
 search_buffer_candidates() {
@@ -1352,7 +1522,7 @@ auto() {
     trap - INT TERM HUP
     return 0
   fi
-  if ! persist_qdisc_tune_state || ! write_facts || ! write_config; then
+  if ! persist_qdisc_tune_state || ! write_facts || ! write_config || ! load_and_verify_config; then
     warn '复测通过，但持久化文件写入失败，正在恢复实验前参数。'
     revert_auto_experiment || fail '持久化失败，且部分参数或活动 qdisc 未能恢复；事务快照与队列快照均已保留。'
     fail '持久化失败，已恢复实验前参数。'
@@ -1360,7 +1530,7 @@ auto() {
   discard_transaction
   trap - INT TERM HUP
   write_runtime_service || warn '网络恢复服务安装失败；当前 TCP 配置有效，重启后活动 FQ 尚未保证恢复。'
-  ok '复测未出现明显退化，已保留候选 TCP 配置。'
+  ok '复测未出现明显退化，候选 TCP 配置已持久化并逐项读回验证。'
   if (( ENABLE_SHAPING )); then
     if [[ $MEASURE_RETRANS_PER_GIB == 0 ]]; then say '验证无重传，跳过限速器扫描。';
     else warn '已启用限速器候选扫描。扫描只给出建议，不会持久化整形。'; scan_shaper_candidate; fi
@@ -1527,11 +1697,19 @@ audit() {
   require_linux; require_command sysctl; require_command ip; show_environment
   if kernel_supports_bbr; then say 'BBR 可用：是'; else say 'BBR 可用：否'; fi
   say "sysctl 配置目录：$([[ -d /etc/sysctl.d ]] && echo 可用 || echo 缺失)"; say "iperf3：$(command -v iperf3 >/dev/null 2>&1 && echo 已安装 || echo 未安装)"; say "systemd：$(command -v systemctl >/dev/null 2>&1 && echo 可用 || echo 不可用)"
+  if report_sysctl_conflicts "${MANAGED_SYSCTL_KEYS[@]}"; then
+    if (( SYSCTL_CONFLICT_COUNT )); then say "持久化 sysctl 重复项：${SYSCTL_CONFLICT_COUNT} 项，均早于本工具加载；无阻断项。"; else say '持久化 sysctl 冲突：未发现'; fi
+  else
+    warn "持久化 sysctl 阻断项：${SYSCTL_BLOCKING_CONFLICT_COUNT} 项；调优前必须处理或显式放行。"
+  fi
   say '提示：选菜单 1、2 或 3 调优时，脚本会自动尝试加载内核已有的 tcp_bbr；OpenVZ/LXC 可能拒绝部分 sysctl 或 qdisc。'
 }
 status() {
   require_linux; require_command sysctl; show_environment
   [[ -f $CONFIG_FILE ]] && { say "持久化配置：$CONFIG_FILE"; yellow "$(sed -n '1,30p' "$CONFIG_FILE")"; printf '\n'; } || warn '未检测到本工具 sysctl 配置。'
+  if [[ -f $CONFIG_FILE ]]; then
+    if verify_managed_config_live; then ok '持久化配置与当前内核运行值逐项一致。'; else warn '持久化配置与运行值存在漂移；请不要假定调优仍然生效。'; fi
+  fi
   [[ -f $FACTS_FILE ]] && { say '上次调优事实：'; yellow "$(cat "$FACTS_FILE")"; printf '\n'; }
   [[ -f $SNAPSHOT_FILE ]] && say "可回滚快照：$SNAPSHOT_FILE" || say '没有 sysctl 快照。'; [[ -f $SHAPE_STATE ]] && say "已存在本工具整形：$(tr '\t' ' ' <"$SHAPE_STATE")" || say '没有本工具整形。'
   [[ -f $QDISC_TUNE_STATE ]] && say "本工具已管理活动 FQ；原活动队列快照：$(tr '\t' ' ' <"$QDISC_TUNE_STATE")" || say '没有本工具管理的活动 qdisc。'
@@ -1582,7 +1760,7 @@ parse_options() {
   while (($#)); do case "$1" in
     --peer) PEER=${2:-}; shift 2 ;; --port) PEER_PORT=${2:-}; shift 2 ;; --role) ROLE=${2:-}; shift 2 ;; --bandwidth) BANDWIDTH_MBIT=${2:-}; shift 2 ;; --rtt) RTT_MS=${2:-}; shift 2 ;; --duration) DURATION=${2:-}; shift 2 ;; --workers) WORKERS=${2:-}; shift 2 ;; --rounds) ROUNDS=${2:-}; shift 2 ;; --policer-rounds) POLICER_ROUNDS=${2:-}; shift 2 ;; --peer-max-rtt) PEER_MAX_RTT=${2:-}; shift 2 ;; --max-test-gib) MAX_TEST_GIB=${2:-}; shift 2 ;; --max-rate-spread) MAX_RATE_SPREAD_PERCENT=${2:-}; shift 2 ;; --shape-rate) SHAPE_RATE=${2:-}; shift 2 ;;
     --initcwnd) INITCWND=${2:-}; shift 2 ;;
-    --enable-shaping) ENABLE_SHAPING=1; shift ;; --search-buffers) BUFFER_SEARCH=1; shift ;; --experiment-qdisc) QDISC_EXPERIMENT=1; shift ;; --allow-public-peers) ALLOW_PUBLIC_PEERS=1; shift ;; --allow-high-traffic) ALLOW_HIGH_TRAFFIC=1; shift ;; --forward-only) BIDIRECTIONAL=0; shift ;; --dry-run) DRY_RUN=1; shift ;; --yes) ASSUME_YES=1; shift ;; --no-install) NO_INSTALL=1; shift ;; --keep-on-regression) KEEP_ON_REGRESSION=1; shift ;; -h|--help) usage; exit 0 ;; *) fail "未知选项：$1" ;;
+    --enable-shaping) ENABLE_SHAPING=1; shift ;; --search-buffers) BUFFER_SEARCH=1; shift ;; --experiment-qdisc) QDISC_EXPERIMENT=1; shift ;; --allow-public-peers) ALLOW_PUBLIC_PEERS=1; shift ;; --allow-high-traffic) ALLOW_HIGH_TRAFFIC=1; shift ;; --allow-sysctl-conflicts) ALLOW_SYSCTL_CONFLICTS=1; shift ;; --forward-only) BIDIRECTIONAL=0; shift ;; --dry-run) DRY_RUN=1; shift ;; --yes) ASSUME_YES=1; shift ;; --no-install) NO_INSTALL=1; shift ;; --keep-on-regression) KEEP_ON_REGRESSION=1; shift ;; -h|--help) usage; exit 0 ;; *) fail "未知选项：$1" ;;
   esac; done
 }
 main() {
