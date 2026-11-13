@@ -194,16 +194,16 @@ sysctl_config_files() {
 }
 
 sysctl_key_is_managed() {
-  local candidate=$1 wanted
+  local candidate=$1 managed_key
   shift
-  for wanted in "$@"; do [[ $candidate == "$wanted" ]] && return 0; done
+  for managed_key in "$@"; do [[ $candidate == "$managed_key" ]] && return 0; done
   return 1
 }
 
 find_sysctl_conflicts() {
   local file raw line key value
-  local -a wanted=("$@") files=()
-  ((${#wanted[@]})) || return 0
+  local -a wanted_keys=("$@") files=()
+  ((${#wanted_keys[@]})) || return 0
   if [[ -n ${SYSCTL_CONFIG_FILES_OVERRIDE:-} ]]; then
     while IFS= read -r file; do [[ -n $file ]] && files+=("$file"); done <<<"$SYSCTL_CONFIG_FILES_OVERRIDE"
   else
@@ -216,7 +216,7 @@ find_sysctl_conflicts() {
       [[ $line == *=* ]] || continue
       key=${line%%=*}; value=${line#*=}
       key=$(normalize_sysctl_value "$key"); key=${key#-}; key=${key//\//.}
-      sysctl_key_is_managed "$key" "${wanted[@]}" || continue
+      sysctl_key_is_managed "$key" "${wanted_keys[@]}" || continue
       value=$(normalize_sysctl_value "$value")
       printf '%s\t%s\t%s\n' "$file" "$key" "$value"
     done <"$file"
@@ -419,12 +419,12 @@ compact_iperf_error() {
   awk 'NF {line=$0} END {gsub(/[[:cntrl:]]/, " ", line); if (line != "") print substr(line, 1, 180)}' <<<"$1"
 }
 run_measure_iperf() {
-  local direction=${1:-forward} port output last_error='' seen=''
+  local direction=${1:-forward} port output last_error='' seen_ports=''
   local -a command=()
   MEASURE_FAILURE=''
   for port in "$PEER_PORT" "${IPERF_PORTS[@]}"; do
-    [[ " $seen " == *" $port "* ]] && continue
-    seen+=" $port"
+    [[ " $seen_ports " == *" $port "* ]] && continue
+    seen_ports+=" $port"
     command=(timeout "$(( DURATION + 15 ))" iperf3 -c "$PEER" -p "$port" -P "$WORKERS" -t "$DURATION" --omit 2)
     [[ $direction == reverse ]] && command+=(-R)
     output=$("${command[@]}" 2>&1) || {
@@ -604,17 +604,17 @@ calculate_backlog() { if (( BANDWIDTH_MBIT >= 5000 )); then printf 32768; else p
 declare -a KEYS=() VALUES=()
 add_setting() { sysctl_exists "$1" || { warn "内核不支持 $1，已跳过。"; return 0; }; KEYS+=("$1"); VALUES+=("$2"); }
 set_setting_value() {
-  local wanted=$1 value=$2 index
+  local setting_key=$1 value=$2 index
   for index in "${!KEYS[@]}"; do
-    if [[ ${KEYS[$index]} == "$wanted" ]]; then VALUES[$index]=$value; return 0; fi
+    if [[ ${KEYS[$index]} == "$setting_key" ]]; then VALUES[$index]=$value; return 0; fi
   done
   return 1
 }
 drop_setting() {
-  local wanted=$1 index
+  local setting_key=$1 index
   local -a kept_keys=() kept_values=()
   for index in "${!KEYS[@]}"; do
-    [[ ${KEYS[$index]} == "$wanted" ]] && continue
+    [[ ${KEYS[$index]} == "$setting_key" ]] && continue
     kept_keys+=("${KEYS[$index]}"); kept_values+=("${VALUES[$index]}")
   done
   KEYS=("${kept_keys[@]}"); VALUES=("${kept_values[@]}")
