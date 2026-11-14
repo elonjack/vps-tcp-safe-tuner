@@ -16,6 +16,7 @@ assert_equals 1 "$(rate_to_mbit 1000 Kbits/sec)" 'Kbit 转 Mbit'
 assert_equals 1126 "$(transfer_to_mib 1.10 GBytes)" 'GBytes 转 MiB'
 assert_equals 1024 "$(retrans_per_gib 1000 1000)" '按传输量归一化重传'
 assert_equals 'limit 2048 flows 512 flow_limit 100 target 5.0ms interval 100.0ms' "$(normalize_qdisc_spec 'limit 2048p flows 512 flow_limit 100p target 5.0ms interval 100.0ms')" 'tc 显示参数规范化'
+assert_equals 85 "$(estimate_wizard_traffic_gib 3000)" '三千兆一键流程约八十GiB级上限'
 
 is_safe_iface eth0 || { printf '常规网卡名校验失败。\n' >&2; exit 1; }
 is_safe_iface 'ens3.100' || { printf 'VLAN 网卡名校验失败。\n' >&2; exit 1; }
@@ -254,14 +255,13 @@ assert_equals 1 "$WIZARD_PATH_CALLS" '五阶段向导调用路径质量检测'
 assert_equals 1 "$WIZARD_SHAPER_CALLS" '五阶段向导调用整形扫描和复测'
 assert_equals 0 "$WIZARD_MODE" '五阶段向导完成后恢复模式标记'
 
-# 菜单中拒绝高流量扫描不能退出整个调优；应只做基础调优并跳过高流量阶段。
+# 菜单1高带宽只做一次总确认；确认后直接完成五阶段，并把总确认视为本次流量授权。
 WIZARD_TUNE_CALLS=0; WIZARD_PATH_CALLS=0; WIZARD_SHAPER_CALLS=0
-guard_test_traffic() { return 1; }; confirm_high_traffic() { return 1; }
-export MENU_MODE=1 ALLOW_HIGH_TRAFFIC=0 TUNING_APPLIED=0
-wizard >/dev/null 2>&1
-assert_equals 1 "$WIZARD_TUNE_CALLS" '拒绝高流量后仍调用基础调优'
-assert_equals 0 "$WIZARD_PATH_CALLS" '拒绝高流量后跳过路径检测'
-assert_equals 0 "$WIZARD_SHAPER_CALLS" '拒绝高流量后跳过扫描和复测'
-assert_equals 0 "$ALLOW_HIGH_TRAFFIC" '拒绝高流量不会误设授权'
+export MENU_MODE=1 ALLOW_HIGH_TRAFFIC=0 TUNING_APPLIED=0 BANDWIDTH_MBIT=3000 MAX_TEST_GIB=50
+wizard >/dev/null
+assert_equals 1 "$WIZARD_TUNE_CALLS" '菜单高带宽确认后调用基础调优'
+assert_equals 1 "$WIZARD_PATH_CALLS" '菜单高带宽确认后调用路径检测'
+assert_equals 1 "$WIZARD_SHAPER_CALLS" '菜单高带宽确认后调用扫描和复测'
+assert_equals 1 "$ALLOW_HIGH_TRAFFIC" '菜单总确认作为本次高流量授权'
 
 printf 'Shell 功能测试通过。\n'

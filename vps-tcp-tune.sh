@@ -6,7 +6,7 @@ set -Eeuo pipefail
 IFS=$'\n\t'
 umask 077
 
-readonly VERSION='6.5.1'
+readonly VERSION='6.5.2'
 readonly STATE_DIR='/var/lib/vps-tcp-safe-tuner'
 readonly SNAPSHOT_FILE="$STATE_DIR/baseline.tsv"
 readonly TRANSACTION_FILE="$STATE_DIR/transaction.tsv"
@@ -169,13 +169,6 @@ confirm_default_yes() {
   yellow "[确认] $message [Y/n] "
   read -r answer
   [[ -z $answer || $answer == y || $answer == Y || $answer == yes || $answer == YES ]]
-}
-
-confirm_high_traffic() {
-  local message=$1 answer
-  yellow "[确认] $message [y/N] "
-  read -r answer
-  [[ $answer == y || $answer == Y || $answer == yes || $answer == YES ]]
 }
 
 lock() {
@@ -400,7 +393,7 @@ retrans_per_gib() {
 guard_test_traffic() {
   local label=$1 rate=$2 tests=$3 estimated_gib
   is_positive_integer "$rate" || return 0
-  estimated_gib=$(awk -v r="$rate" -v d="$DURATION" -v n="$tests" 'BEGIN {g=r*d*n*1000000/8/1073741824; printf "%d", (g==int(g)?g:int(g)+1)}')
+  estimated_gib=$(estimate_test_traffic_gib "$rate" "$tests")
   say "$label：按 ${rate}Mbit/s、${tests} 次、每次 ${DURATION}s 估算，最多约 ${estimated_gib} GiB。"
   (( estimated_gib <= MAX_TEST_GIB )) && return 0
   if (( ALLOW_HIGH_TRAFFIC )); then
@@ -408,8 +401,17 @@ guard_test_traffic() {
     return 0
   fi
   MEASURE_FAILURE="$label 估算约 ${estimated_gib} GiB，超过上限 ${MAX_TEST_GIB} GiB"
-  warn "$MEASURE_FAILURE；尚未发送该阶段测速流量。交互向导可选择只做基础调优，命令行需显式加入 --allow-high-traffic。"
+  warn "$MEASURE_FAILURE；尚未发送该阶段测速流量。菜单1会在总确认时授权，命令行需显式加入 --allow-high-traffic。"
   return 1
+}
+estimate_test_traffic_gib() {
+  local rate=$1 tests=$2
+  awk -v r="$rate" -v d="$DURATION" -v n="$tests" 'BEGIN {g=r*d*n*1000000/8/1073741824; printf "%d", (g==int(g)?g:int(g)+1)}'
+}
+estimate_wizard_traffic_gib() {
+  local rate=$1
+  # 8秒×40%路径检查 + 12秒×（基线1档 + 扫描最多18档 + 最终验证1档）。
+  awk -v r="$rate" 'BEGIN {seconds=8*0.4+12*20; g=r*seconds*1000000/8/1073741824; printf "%d", (g==int(g)?g:int(g)+1)}'
 }
 MEASURE_RATE=''; MEASURE_RETRANS=''; MEASURE_RETRANS_PER_GIB=''; MEASURE_TRANSFER_MIB=''; MEASURE_RATE_SPREAD=''; MEASURE_NOISY=0
 MEASURE_REVERSE_RATE=''; MEASURE_REVERSE_RETRANS_PER_GIB=''; MEASURE_REVERSE_TRANSFER_MIB=''; MEASURE_REVERSE_RATE_SPREAD=''; MEASURE_REVERSE_NOISY=0
@@ -1466,7 +1468,7 @@ probe_adaptive_shaper_candidate() {
 path_quality_check() {
   validate_peer; ensure_iperf3; require_command tc
   local iface original original_spec snapshot qdisc_backup target_rate
-  local saved_rounds=$ROUNDS saved_bidirectional=$BIDIRECTIONAL saved_bandwidth=$BANDWIDTH_MBIT
+  local saved_rounds=$ROUNDS saved_bidirectional=$BIDIRECTIONAL saved_bandwidth=$BANDWIDTH_MBIT saved_duration=$DURATION saved_workers=$WORKERS
   iface=$(default_interface); [[ -n $iface ]] || { warn '未检测到默认出口网卡，无法进行路径质量检测。'; return 1; }
   validate_iface "$iface"
   target_rate=$(( BANDWIDTH_MBIT * 40 / 100 )); (( target_rate < 1 )) && target_rate=1
@@ -1474,19 +1476,20 @@ path_quality_check() {
   snapshot=$(qdisc_snapshot "$iface" "$qdisc_backup") || { rm -f -- "$qdisc_backup"; warn '当前根 qdisc 无法精确重建，跳过路径质量检测。'; return 1; }
   IFS=$'\t' read -r original original_spec <<<"$snapshot"
   [[ $original == mq ]] || rm -f -- "$qdisc_backup"
-  ROUNDS=$POLICER_ROUNDS; BIDIRECTIONAL=0; BANDWIDTH_MBIT=$target_rate
-  trap 'restore_root_qdisc "$iface" "$original" "$original_spec" >/dev/null 2>&1 || true; remove_qdisc_snapshot "$qdisc_backup"; ROUNDS=$saved_rounds; BIDIRECTIONAL=$saved_bidirectional; BANDWIDTH_MBIT=$saved_bandwidth' EXIT
+  if (( WIZARD_MODE )); then ROUNDS=1; DURATION=8; WORKERS=1; else ROUNDS=$POLICER_ROUNDS; fi
+  BIDIRECTIONAL=0; BANDWIDTH_MBIT=$target_rate
+  trap 'restore_root_qdisc "$iface" "$original" "$original_spec" >/dev/null 2>&1 || true; remove_qdisc_snapshot "$qdisc_backup"; ROUNDS=$saved_rounds; BIDIRECTIONAL=$saved_bidirectional; BANDWIDTH_MBIT=$saved_bandwidth; DURATION=$saved_duration; WORKERS=$saved_workers' EXIT
   trap 'exit 130' INT TERM HUP
   say "以套餐带宽的 40%（${target_rate}Mbit/s）临时应用 HTB+FQ，检测低于限速器拐点时的线路底噪。"
   if ! apply_shape "$iface" "$target_rate" || ! measure; then
     restore_root_qdisc "$iface" "$original" "$original_spec" >/dev/null 2>&1 || true
-    remove_qdisc_snapshot "$qdisc_backup"; ROUNDS=$saved_rounds; BIDIRECTIONAL=$saved_bidirectional; BANDWIDTH_MBIT=$saved_bandwidth
+    remove_qdisc_snapshot "$qdisc_backup"; ROUNDS=$saved_rounds; BIDIRECTIONAL=$saved_bidirectional; BANDWIDTH_MBIT=$saved_bandwidth; DURATION=$saved_duration; WORKERS=$saved_workers
     trap - EXIT INT TERM HUP
     warn '路径质量检测没有取得可靠样本；基础调优保留，后续扫描会自行判定。'
     return 1
   fi
   restore_root_qdisc "$iface" "$original" "$original_spec" || fail '路径质量检测后恢复根 qdisc 失败，请立即检查网络。'
-  remove_qdisc_snapshot "$qdisc_backup"; ROUNDS=$saved_rounds; BIDIRECTIONAL=$saved_bidirectional; BANDWIDTH_MBIT=$saved_bandwidth
+  remove_qdisc_snapshot "$qdisc_backup"; ROUNDS=$saved_rounds; BIDIRECTIONAL=$saved_bidirectional; BANDWIDTH_MBIT=$saved_bandwidth; DURATION=$saved_duration; WORKERS=$saved_workers
   trap - EXIT INT TERM HUP
   if (( MEASURE_RETRANS_PER_GIB <= RETRANS_PER_GIB_HARD_LIMIT )); then
     ok "40% 速率路径样本干净：${MEASURE_RATE}Mbit/s，重传 ${MEASURE_RETRANS_PER_GIB} 次/GiB。"
@@ -1640,19 +1643,34 @@ auto() {
 }
 tune_shaper() {
   local base_rate base_retrans reverse_rate reverse_retrans iface snapshot kind spec backup saved_yes=$ASSUME_YES accepted=0
+  local saved_rounds=$ROUNDS saved_bidirectional=$BIDIRECTIONAL saved_duration=$DURATION saved_workers=$WORKERS
   [[ ! -f $SHAPE_STATE ]] || { warn '已有受管整形，跳过重复扫描。'; return 0; }
   (( WIZARD_MODE == 0 )) || say '[3/5] 限速器拐点扫描：先记录基础调优后的全速基线。'
-  if ! measure; then warn '验证样本不足；已保留完成的基础调优，跳过整形。'; return 0; fi
+  if (( WIZARD_MODE )); then ROUNDS=1; BIDIRECTIONAL=0; DURATION=12; WORKERS=1; fi
+  if ! measure; then
+    ROUNDS=$saved_rounds; BIDIRECTIONAL=$saved_bidirectional; DURATION=$saved_duration; WORKERS=$saved_workers
+    warn '验证样本不足；已保留完成的基础调优，跳过整形。'; return 0
+  fi
   base_rate=$MEASURE_RATE; base_retrans=$MEASURE_RETRANS_PER_GIB
   reverse_rate=${MEASURE_REVERSE_RATE:-0}; reverse_retrans=${MEASURE_REVERSE_RETRANS_PER_GIB:-0}
   if (( base_retrans <= RETRANS_PER_GIB_HARD_LIMIT )); then
     say '全速基线重传未达到限速器扫描门槛，保持不整形。'
-    (( WIZARD_MODE == 0 )) || { say '[4/5] 没有发现需要整形的证据。'; say '[5/5] 基础调优已保留；无需继续消耗扫描流量。'; }
+    if (( WIZARD_MODE )); then
+      say '[4/5] 没有发现需要整形的证据。'
+      say '[5/5] 进行一次单流最终验证。'
+      measure || warn '最终验证未取得样本；基础调优仍保留。'
+    fi
+    ROUNDS=$saved_rounds; BIDIRECTIONAL=$saved_bidirectional; DURATION=$saved_duration; WORKERS=$saved_workers
     return 0
   fi
   scan_shaper_candidate
   if [[ -z $RECOMMENDED_SHAPE_RATE ]]; then
-    (( WIZARD_MODE == 0 )) || { say '[4/5] 未找到可信拐点，不应用整形。'; say '[5/5] 已保留基础调优；全速基线没有证据支持额外限速。'; }
+    if (( WIZARD_MODE )); then
+      say '[4/5] 未找到可信拐点，不应用整形。'
+      say '[5/5] 进行一次单流最终验证。'
+      measure || warn '最终验证未取得样本；基础调优仍保留。'
+    fi
+    ROUNDS=$saved_rounds; BIDIRECTIONAL=$saved_bidirectional; DURATION=$saved_duration; WORKERS=$saved_workers
     return 0
   fi
   (( WIZARD_MODE == 0 )) || say "[4/5] 临时应用 ${RECOMMENDED_SHAPE_RATE}Mbit/s 候选整形。"
@@ -1678,6 +1696,7 @@ tune_shaper() {
     ASSUME_YES=$saved_yes
     ok '候选整形已通过同对端复测并持久化：吞吐提高至少 5%，或吞吐保持 95% 且重传减少至少一半。'
   else say '候选整形未证实收益；保留基础调优及原队列，不持久化限速。'; fi
+  ROUNDS=$saved_rounds; BIDIRECTIONAL=$saved_bidirectional; DURATION=$saved_duration; WORKERS=$saved_workers
 }
 route_field() {
   awk -v key="$1" '{for(i=1;i<NF;i++)if($i==key){print $(i+1);exit}}' <<<"$2"
@@ -1785,7 +1804,7 @@ remove_runtime_service() {
   if command -v systemctl >/dev/null 2>&1 && [[ -d /run/systemd/system ]]; then systemctl daemon-reload; fi
 }
 wizard() {
-  local saved_yes=$ASSUME_YES estimated_tests skip_heavy_tests=0
+  local saved_yes=$ASSUME_YES estimated_gib menu_high_traffic=0
   require_root; require_linux; validate_common; ensure_iperf3
   [[ -n $PEER ]] || auto_pick_peer
   validate_peer
@@ -1798,31 +1817,30 @@ wizard() {
     say "实测容量约 ${BANDWIDTH_MBIT}Mbit/s；TCP 窗口按 ${BUFFER_BANDWIDTH_MBIT}Mbit/s 常见端口档位推导。"
   fi
   [[ -n $RTT_MS ]] || RTT_MS=$AUTO_TARGET_RTT_MS
-  estimated_tests=$(( ROUNDS * 4 + POLICER_ROUNDS * 2 + 15 ))
-  if ! guard_test_traffic '五阶段一键调优（最坏情况）' "$BANDWIDTH_MBIT" "$estimated_tests"; then
-    if [[ -t 0 || $MENU_MODE == 1 ]] && confirm_high_traffic "预计流量超过默认 ${MAX_TEST_GIB}GiB 护栏；继续完整扫描吗？选择 N 仍会完成基础调优。"; then
-      ALLOW_HIGH_TRAFFIC=1
-    elif [[ -t 0 || $MENU_MODE == 1 ]]; then
-      skip_heavy_tests=1
-      warn '已选择 N：不会退出调优；将完成基础 TCP 调优，但跳过路径检测、拐点扫描和满速复测。'
-    else
-      fail '未获得高流量授权，未修改系统。可改用菜单2快速基础调优。'
+  # 与 tcpfit 的一键流程保持同一量级：40%单流检查、单流基线、最多约18档自适应扫描、单流复测。
+  # 实际在全速基线干净时会提前结束，通常远低于上限。
+  estimated_gib=$(estimate_wizard_traffic_gib "$BANDWIDTH_MBIT")
+  if (( MENU_MODE )); then
+    say "五阶段一键调优：按 ${BANDWIDTH_MBIT}Mbit/s 估算，完整扫描最多约 ${estimated_gib} GiB；基线干净会提前结束。"
+    if (( estimated_gib > MAX_TEST_GIB )); then
+      menu_high_traffic=1
+      warn "带宽较高，完整扫描可能超过默认 ${MAX_TEST_GIB}GiB；下面的唯一一次开始确认同时作为本次流量授权。"
+    fi
+  else
+    say "五阶段一键调优：按 ${BANDWIDTH_MBIT}Mbit/s 估算，完整扫描最多约 ${estimated_gib} GiB；基线干净会提前结束。"
+    if (( estimated_gib > MAX_TEST_GIB && ALLOW_HIGH_TRAFFIC == 0 )); then
+      fail '非菜单完整扫描超过流量护栏；请显式加入 --allow-high-traffic，或使用 tune 只做基础调优。'
     fi
   fi
   line
   say '五阶段流程：1 基础调优 → 2 40%路径质量 → 3 policer拐点扫描 → 4 候选整形 → 5 同对端复测。'
   say "带宽=${BANDWIDTH_MBIT}Mbit/s；目标RTT=${RTT_MS}ms；对端=$PEER:$PEER_PORT；用途=$ROLE。"
-  confirm_default_yes '开始调优吗？选择过高流量 N 时将自动降级为基础调优。' || { say '已取消，未修改系统。'; return 0; }
+  confirm_default_yes '开始完整五阶段调优吗？' || { say '已取消，未修改系统。'; return 0; }
+  (( menu_high_traffic == 0 )) || ALLOW_HIGH_TRAFFIC=1
   ASSUME_YES=1; WIZARD_MODE=1; ENABLE_SHAPING=0
   say '[1/5] 基础调优：快照、BBR、活动FQ、自适应缓冲区、丢包恢复与initcwnd。'
   tune
   (( TUNING_APPLIED )) || { ASSUME_YES=$saved_yes; WIZARD_MODE=0; return 0; }
-  if (( skip_heavy_tests )); then
-    say '[2/5–5/5] 已按你的 N 选择跳过高流量检测、扫描与复测；基础调优已经生效。'
-    ASSUME_YES=$saved_yes; WIZARD_MODE=0
-    line; ok '基础调优完成；未因拒绝高流量扫描而退出或撤销。'; line
-    return 0
-  fi
   say '[2/5] 路径质量检测：以40%套餐速率区分线路底噪与出口限速器丢包。'
   path_quality_check || true
   ENABLE_SHAPING=1
