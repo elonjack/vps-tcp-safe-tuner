@@ -56,7 +56,11 @@ if ($content -notmatch 'verify_built_settings') { throw 'Missing live sysctl rea
 if ($content -notmatch 'CONFIG_TRANSACTION_FILE') { throw 'Missing managed-config transaction backup.' }
 if ($content -notmatch 'estimate_buffer_bandwidth') { throw 'Missing measured-capacity headroom for automatic buffer sizing.' }
 if ($content -notmatch 'buffer_bandwidth_mbit') { throw 'Missing recorded buffer-capacity fact.' }
-if ($installContent -notmatch "readonly VERSION='6\.4\.0'") { throw 'Installer version is stale.' }
+if ($content -notmatch '(?m)^wizard\(\)') { throw 'Missing five-stage wizard entry point.' }
+if ($content -notmatch '(?m)^path_quality_check\(\)') { throw 'Missing 40-percent path-quality stage.' }
+if ($content -notmatch 'coarse=\(55 70 82 90 96 100 106 114 123 133 145\)') { throw 'Missing low-to-high policer sweep.' }
+if ($content -notmatch 'APPLIED_CHANGED_COUNT' -or $content -notmatch 'APPLIED_UNCHANGED_COUNT') { throw 'Apply result must distinguish changed and unchanged settings.' }
+if ($installContent -notmatch "readonly VERSION='6\.5\.0'") { throw 'Installer version is stale.' }
 if ($installContent -match "EXPECTED_SHA256='TO_BE_REPLACED'") { throw 'Installer checksum placeholder was not replaced.' }
 if ($installContent -notmatch '--local') { throw 'Installer needs an offline/local verified path.' }
 $expectedMatch = [regex]::Match($installContent, "EXPECTED_SHA256='([0-9a-f]{64})'")

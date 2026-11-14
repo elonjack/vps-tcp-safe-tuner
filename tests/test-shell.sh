@@ -208,10 +208,13 @@ ALLOW_SYSCTL_CONFLICTS=0
 unset SYSCTL_CONFIG_FILES_OVERRIDE
 rm -rf "$conflict_dir"
 
+SYSCTL_ONE=1; SYSCTL_TWO='2 3'
 sysctl() {
   if [[ $1 == -n ]]; then
-    case "$2" in one) printf '1\n' ;; two) printf '2  3\n' ;; *) return 1 ;; esac
+    case "$2" in one) printf '%s\n' "$SYSCTL_ONE" ;; two) printf '%s\n' "$SYSCTL_TWO" ;; *) return 1 ;; esac
   elif [[ $1 == -aN ]]; then printf 'one\ntwo\n';
+  elif [[ $1 == -q && $2 == -w ]]; then
+    case "$3" in one=*) SYSCTL_ONE=${3#*=} ;; two=*) SYSCTL_TWO=${3#*=} ;; *) return 1 ;; esac
   else return 1
   fi
 }
@@ -219,6 +222,24 @@ KEYS=(one two); VALUES=(1 '2 3')
 verify_built_settings || { printf '正确写入值未通过读回验证。\n' >&2; exit 1; }
 VALUES=(1 '2 4')
 if verify_built_settings >/dev/null 2>&1; then printf '错误写入值未被读回验证发现。\n' >&2; exit 1; fi
+apply_built_settings || { printf '设置应用计数测试写入失败。\n' >&2; exit 1; }
+assert_equals 1 "$APPLIED_CHANGED_COUNT" '实际改变设置计数'
+assert_equals 1 "$APPLIED_UNCHANGED_COUNT" '原本一致设置计数'
+verify_built_settings || { printf '设置应用计数测试写入后验证失败。\n' >&2; exit 1; }
 unset -f sysctl
+
+# 五阶段向导必须按顺序调用基础调优、40%路径检测和整形扫描/复测。
+WIZARD_TUNE_CALLS=0; WIZARD_PATH_CALLS=0; WIZARD_SHAPER_CALLS=0
+require_root() { :; }; require_linux() { :; }; ensure_iperf3() { :; }; validate_peer() { :; }
+guard_test_traffic() { return 0; }; confirm() { return 0; }
+tune() { WIZARD_TUNE_CALLS=$(( WIZARD_TUNE_CALLS + 1 )); TUNING_APPLIED=1; }
+path_quality_check() { WIZARD_PATH_CALLS=$(( WIZARD_PATH_CALLS + 1 )); }
+tune_shaper() { WIZARD_SHAPER_CALLS=$(( WIZARD_SHAPER_CALLS + 1 )); }
+export BANDWIDTH_MBIT=1000 BUFFER_BANDWIDTH_MBIT='' RTT_MS='' ROLE=proxy PEER=trusted.example PEER_PORT=5201 BIDIRECTIONAL=1 ASSUME_YES=0 WIZARD_MODE=0 ENABLE_SHAPING=0
+wizard >/dev/null
+assert_equals 1 "$WIZARD_TUNE_CALLS" '五阶段向导调用基础调优'
+assert_equals 1 "$WIZARD_PATH_CALLS" '五阶段向导调用路径质量检测'
+assert_equals 1 "$WIZARD_SHAPER_CALLS" '五阶段向导调用整形扫描和复测'
+assert_equals 0 "$WIZARD_MODE" '五阶段向导完成后恢复模式标记'
 
 printf 'Shell 功能测试通过。\n'

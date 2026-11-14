@@ -6,7 +6,7 @@ set -Eeuo pipefail
 IFS=$'\n\t'
 umask 077
 
-readonly VERSION='6.4.0'
+readonly VERSION='6.5.0'
 readonly STATE_DIR='/var/lib/vps-tcp-safe-tuner'
 readonly SNAPSHOT_FILE="$STATE_DIR/baseline.tsv"
 readonly TRANSACTION_FILE="$STATE_DIR/transaction.tsv"
@@ -41,6 +41,7 @@ DURATION='12'; WORKERS='4'; ROUNDS='3'; POLICER_ROUNDS='3'; PEER_MAX_RTT='120'; 
 ALLOW_SYSCTL_CONFLICTS=0
 SYSCTL_CONFLICT_COUNT=0; SYSCTL_BLOCKING_CONFLICT_COUNT=0
 TUNING_APPLIED=0; DEFER_PERSIST=0; BBR_MODULE_CONFIG_CREATED=0
+APPLIED_CHANGED_COUNT=0; APPLIED_UNCHANGED_COUNT=0; WIZARD_MODE=0
 QDISC_SELECTED_FQ=0; QDISC_CHANGED=0; QDISC_ORIGINAL_IFACE=''; QDISC_ORIGINAL_KIND=''; QDISC_ORIGINAL_SPEC=''; QDISC_BACKUP_FILE=''
 NOISY_LINK=0
 INITCWND=32
@@ -93,7 +94,8 @@ vps-tcp-tune - 自适应 Linux VPS TCP 调优工具
   menu                         中文交互菜单（默认）
   audit                        只检测内核、虚拟化、网卡和 TCP 能力
   measure [--peer 主机]        多轮吞吐、重传、RTT 基线测试；省略对端则自动选择公共节点
-  tune --bandwidth N [--rtt N] 一键基础调优：直接应用 BBR、FQ 和自适应缓冲区
+  wizard --bandwidth N          五阶段一键调优：基础配置、路径检测、拐点扫描、整形、验证
+  tune --bandwidth N [--rtt N] 快速基础调优：直接应用 BBR、FQ 和自适应缓冲区
   auto --peer 主机             实测后自动推导 BDP 并应用、复测调优
   deep --peer 主机             深度实验：缓冲区倍率 + 活动 FQ 队列双向 A/B 择优
   apply --bandwidth N --rtt N  按已知带宽/RTT 应用调优
@@ -877,8 +879,14 @@ restore_legacy_core_defaults() {
   done
 }
 apply_built_settings() {
-  local index
+  local index current expected
+  APPLIED_CHANGED_COUNT=0; APPLIED_UNCHANGED_COUNT=0
   for index in "${!KEYS[@]}"; do
+    current=$(normalize_sysctl_value "$(sysctl_value "${KEYS[$index]}")")
+    expected=$(normalize_sysctl_value "${VALUES[$index]}")
+    if [[ $current == "$expected" ]]; then APPLIED_UNCHANGED_COUNT=$(( APPLIED_UNCHANGED_COUNT + 1 ))
+    else APPLIED_CHANGED_COUNT=$(( APPLIED_CHANGED_COUNT + 1 ))
+    fi
     sysctl -q -w "${KEYS[$index]}=${VALUES[$index]}" || return 1
   done
 }
@@ -965,7 +973,7 @@ apply_tuning() {
     fi
     discard_transaction; TUNING_APPLIED=1
     write_runtime_service || warn '网络恢复服务安装失败；当前配置有效，重启恢复尚未完成。'
-    ok "已应用并逐项读回验证 ${#KEYS[@]} 项自适应 TCP 设置。"
+    ok "已写入并逐项读回验证 ${#KEYS[@]} 项 TCP 设置：实际改变 ${APPLIED_CHANGED_COUNT} 项，原本一致 ${APPLIED_UNCHANGED_COUNT} 项。"
   fi
 }
 search_buffer_candidates() {
@@ -1414,11 +1422,42 @@ probe_shaper_candidate() {
   say "扫描 ${candidate_rate}Mbit：中位吞吐 ${MEASURE_RATE}Mbit，重传 ${MEASURE_RETRANS_PER_GIB} 次/GiB。"
   policer_candidate_is_clean "$MEASURE_RATE" "$MEASURE_RETRANS_PER_GIB" "$candidate_rate" "$baseline_retrans_per_gib"
 }
+path_quality_check() {
+  validate_peer; ensure_iperf3; require_command tc
+  local iface original original_spec snapshot qdisc_backup target_rate
+  local saved_rounds=$ROUNDS saved_bidirectional=$BIDIRECTIONAL saved_bandwidth=$BANDWIDTH_MBIT
+  iface=$(default_interface); [[ -n $iface ]] || { warn '未检测到默认出口网卡，无法进行路径质量检测。'; return 1; }
+  validate_iface "$iface"
+  target_rate=$(( BANDWIDTH_MBIT * 40 / 100 )); (( target_rate < 1 )) && target_rate=1
+  install -d -m 700 "$STATE_DIR"; qdisc_backup=$(mktemp "$STATE_DIR/qdisc-path-check.XXXXXX")
+  snapshot=$(qdisc_snapshot "$iface" "$qdisc_backup") || { rm -f -- "$qdisc_backup"; warn '当前根 qdisc 无法精确重建，跳过路径质量检测。'; return 1; }
+  IFS=$'\t' read -r original original_spec <<<"$snapshot"
+  [[ $original == mq ]] || rm -f -- "$qdisc_backup"
+  ROUNDS=$POLICER_ROUNDS; BIDIRECTIONAL=0; BANDWIDTH_MBIT=$target_rate
+  trap 'restore_root_qdisc "$iface" "$original" "$original_spec" >/dev/null 2>&1 || true; remove_qdisc_snapshot "$qdisc_backup"; ROUNDS=$saved_rounds; BIDIRECTIONAL=$saved_bidirectional; BANDWIDTH_MBIT=$saved_bandwidth' EXIT
+  trap 'exit 130' INT TERM HUP
+  say "以套餐带宽的 40%（${target_rate}Mbit/s）临时应用 HTB+FQ，检测低于限速器拐点时的线路底噪。"
+  if ! apply_shape "$iface" "$target_rate" || ! measure; then
+    restore_root_qdisc "$iface" "$original" "$original_spec" >/dev/null 2>&1 || true
+    remove_qdisc_snapshot "$qdisc_backup"; ROUNDS=$saved_rounds; BIDIRECTIONAL=$saved_bidirectional; BANDWIDTH_MBIT=$saved_bandwidth
+    trap - EXIT INT TERM HUP
+    warn '路径质量检测没有取得可靠样本；基础调优保留，后续扫描会自行判定。'
+    return 1
+  fi
+  restore_root_qdisc "$iface" "$original" "$original_spec" || fail '路径质量检测后恢复根 qdisc 失败，请立即检查网络。'
+  remove_qdisc_snapshot "$qdisc_backup"; ROUNDS=$saved_rounds; BIDIRECTIONAL=$saved_bidirectional; BANDWIDTH_MBIT=$saved_bandwidth
+  trap - EXIT INT TERM HUP
+  if (( MEASURE_RETRANS_PER_GIB <= RETRANS_PER_GIB_HARD_LIMIT )); then
+    ok "40% 速率路径样本干净：${MEASURE_RATE}Mbit/s，重传 ${MEASURE_RETRANS_PER_GIB} 次/GiB。"
+  else
+    warn "40% 速率仍有较高重传（${MEASURE_RETRANS_PER_GIB} 次/GiB）；线路本身可能有损，后续拐点会保守判定。"
+  fi
+}
 scan_shaper_candidate() {
   RECOMMENDED_SHAPE_RATE=''
   validate_peer; ensure_iperf3; require_command tc
   local nominal candidate best='' last_clean='' broke_at='' iface original original_spec snapshot saved_rounds saved_bidirectional baseline_retrans_per_gib qdisc_backup probe_status safe_rate
-  local -a coarse=(85 92 99 106 114 123 133 145)
+  local -a coarse=(55 70 82 90 96 100 106 114 123 133 145)
   iface=$(default_interface); [[ -n $iface ]] || fail '未检测到默认出口网卡。'
   validate_iface "$iface"
   install -d -m 700 "$STATE_DIR"; qdisc_backup=$(mktemp "$STATE_DIR/qdisc-scan.XXXXXX")
@@ -1426,9 +1465,9 @@ scan_shaper_candidate() {
   IFS=$'\t' read -r original original_spec <<<"$snapshot"
   [[ $original == mq ]] || rm -f -- "$qdisc_backup"
   nominal=${MEASURE_RATE:-$BANDWIDTH_MBIT}
-  guard_test_traffic '限速器拐点扫描（最坏情况）' "$nominal" "$(( POLICER_ROUNDS * 16 ))" || { warn '已跳过高流量限速器扫描；基础 TCP 调优不受影响。'; remove_qdisc_snapshot "$qdisc_backup"; return 0; }
+  guard_test_traffic '限速器拐点扫描（最坏情况）' "$nominal" "$(( POLICER_ROUNDS * 32 ))" || { warn '已跳过高流量限速器扫描；基础 TCP 调优不受影响。'; remove_qdisc_snapshot "$qdisc_backup"; return 0; }
   baseline_retrans_per_gib=${MEASURE_RETRANS_PER_GIB:-0}
-  say "开始限速器拐点扫描：以 ${nominal}Mbit 基线从 85% 到 145% 自适应粗扫。"
+  say "开始限速器拐点扫描：以 ${nominal}Mbit 全速基线从 55% 到 145% 自适应粗扫。"
   say "每个候选使用 ${POLICER_ROUNDS} 轮测试；判定会同时参考基线重传噪声和送达率。"
   say '发现拐点后使用二分法精扫；每轮临时 HTB+FQ 后都会恢复原 qdisc。'
   confirm "扫描会暂时替换 $iface 的根 qdisc，预计消耗较多流量。继续吗？" || { remove_qdisc_snapshot "$qdisc_backup"; say '已跳过扫描。'; return 0; }
@@ -1560,17 +1599,25 @@ auto() {
 tune_shaper() {
   local base_rate base_retrans reverse_rate reverse_retrans iface snapshot kind spec backup saved_yes=$ASSUME_YES accepted=0
   [[ ! -f $SHAPE_STATE ]] || { warn '已有受管整形，跳过重复扫描。'; return 0; }
+  (( WIZARD_MODE == 0 )) || say '[3/5] 限速器拐点扫描：先记录基础调优后的全速基线。'
   if ! measure; then warn '验证样本不足；已保留完成的基础调优，跳过整形。'; return 0; fi
   base_rate=$MEASURE_RATE; base_retrans=$MEASURE_RETRANS_PER_GIB
   reverse_rate=${MEASURE_REVERSE_RATE:-0}; reverse_retrans=${MEASURE_REVERSE_RETRANS_PER_GIB:-0}
-  (( base_retrans > RETRANS_PER_GIB_HARD_LIMIT )) || { say '出站重传未达到扫描门槛，保持不整形。'; return 0; }
+  if (( WIZARD_MODE == 0 && base_retrans <= RETRANS_PER_GIB_HARD_LIMIT )); then
+    say '出站重传未达到扫描门槛，保持不整形。'; return 0
+  fi
   scan_shaper_candidate
-  [[ -n $RECOMMENDED_SHAPE_RATE ]] || return 0
+  if [[ -z $RECOMMENDED_SHAPE_RATE ]]; then
+    (( WIZARD_MODE == 0 )) || { say '[4/5] 未找到可信拐点，不应用整形。'; say '[5/5] 已保留基础调优；全速基线没有证据支持额外限速。'; }
+    return 0
+  fi
+  (( WIZARD_MODE == 0 )) || say "[4/5] 临时应用 ${RECOMMENDED_SHAPE_RATE}Mbit/s 候选整形。"
   iface=$(default_interface); backup=$(mktemp "$STATE_DIR/qdisc-lab.XXXXXX")
   snapshot=$(qdisc_snapshot "$iface" "$backup") || { rm -f "$backup"; return 1; }
   IFS=$'\t' read -r kind spec <<<"$snapshot"
   trap 'restore_root_qdisc "$iface" "$kind" "$spec" || true; remove_qdisc_snapshot "$backup"' EXIT
   trap 'exit 130' INT TERM HUP
+  (( WIZARD_MODE == 0 )) || say '[5/5] 使用同一对端复测候选整形，只有吞吐/重传达标才持久化。'
   if apply_shape "$iface" "$RECOMMENDED_SHAPE_RATE" && measure; then
     if ! is_material_regression "$base_rate" "$base_retrans" "$MEASURE_RATE" "$MEASURE_RETRANS_PER_GIB" &&
        { (( BIDIRECTIONAL == 0 )) || ! is_material_regression "$reverse_rate" "$reverse_retrans" "$MEASURE_REVERSE_RATE" "$MEASURE_REVERSE_RETRANS_PER_GIB"; }; then
@@ -1693,13 +1740,50 @@ remove_runtime_service() {
   for path in "$RUNTIME_SCRIPT" "$RUNTIME_UNIT" "$RUNTIME_TIMER"; do remove_managed_file "$path" "$RUNTIME_MARKER"; done
   if command -v systemctl >/dev/null 2>&1 && [[ -d /run/systemd/system ]]; then systemctl daemon-reload; fi
 }
+wizard() {
+  local saved_yes=$ASSUME_YES estimated_tests
+  require_root; require_linux; validate_common; ensure_iperf3
+  [[ -n $PEER ]] || auto_pick_peer
+  validate_peer
+  if [[ -z $BANDWIDTH_MBIT ]]; then
+    say '带宽留空：先用所选对端进行双向多轮容量探测，再按较大方向推导基础配置。'
+    if ! measure; then fail '带宽探测没有取得可靠样本，未修改系统。请换一个可信对端后重试。'; fi
+    BANDWIDTH_MBIT=$MEASURE_RATE
+    if (( BIDIRECTIONAL )) && [[ -n ${MEASURE_REVERSE_RATE:-} ]] && (( MEASURE_REVERSE_RATE > BANDWIDTH_MBIT )); then BANDWIDTH_MBIT=$MEASURE_REVERSE_RATE; fi
+    BUFFER_BANDWIDTH_MBIT=$(estimate_buffer_bandwidth "$BANDWIDTH_MBIT")
+    say "实测容量约 ${BANDWIDTH_MBIT}Mbit/s；TCP 窗口按 ${BUFFER_BANDWIDTH_MBIT}Mbit/s 常见端口档位推导。"
+  fi
+  [[ -n $RTT_MS ]] || RTT_MS=$AUTO_TARGET_RTT_MS
+  estimated_tests=$(( POLICER_ROUNDS * 32 + ROUNDS * 5 ))
+  if ! guard_test_traffic '五阶段一键调优（最坏情况）' "$BANDWIDTH_MBIT" "$estimated_tests"; then
+    if [[ -t 0 && -t 1 ]] && confirm "预计流量超过默认 ${MAX_TEST_GIB}GiB 护栏；明确允许本次高流量扫描吗？"; then
+      ALLOW_HIGH_TRAFFIC=1
+    else
+      fail '未获得高流量授权，未修改系统。可改用菜单2快速基础调优。'
+    fi
+  fi
+  line
+  say '五阶段流程：1 基础调优 → 2 40%路径质量 → 3 policer拐点扫描 → 4 候选整形 → 5 同对端复测。'
+  say "带宽=${BANDWIDTH_MBIT}Mbit/s；目标RTT=${RTT_MS}ms；对端=$PEER:$PEER_PORT；用途=$ROLE。"
+  confirm '确认开始五阶段一键调优吗？确认后除异常流量护栏外不再中途询问。' || { say '已取消，未修改系统。'; return 0; }
+  ASSUME_YES=1; WIZARD_MODE=1; ENABLE_SHAPING=0
+  say '[1/5] 基础调优：快照、BBR、活动FQ、自适应缓冲区、丢包恢复与initcwnd。'
+  tune
+  (( TUNING_APPLIED )) || { ASSUME_YES=$saved_yes; WIZARD_MODE=0; return 0; }
+  say '[2/5] 路径质量检测：以40%套餐速率区分线路底噪与出口限速器丢包。'
+  path_quality_check || true
+  ENABLE_SHAPING=1
+  tune_shaper
+  ASSUME_YES=$saved_yes; WIZARD_MODE=0
+  line; ok '五阶段一键调优完成；只有通过同对端复测的整形候选才会持久化。'; line
+}
 tune() {
   [[ -n $BANDWIDTH_MBIT ]] || fail 'tune 需要 --bandwidth（VPS 套餐或端口带宽，Mbit/s）。'
   if [[ -z $RTT_MS ]]; then
     RTT_MS=$AUTO_TARGET_RTT_MS
     say "未指定 --rtt，按跨境代理常用目标 ${RTT_MS}ms 推导缓冲区。"
   fi
-  say '一键基础调优不依赖 iperf3 稳定性；将直接按套餐带宽、目标 RTT 和内存应用 BBR + FQ + 自适应缓冲区。'
+  say '快速基础调优不依赖 iperf3 稳定性；将直接按套餐带宽、目标 RTT 和内存应用 BBR + FQ + 自适应缓冲区。'
   apply_tuning
   (( DRY_RUN == 0 && TUNING_APPLIED )) || return 0
   apply_route_windows || warn '初始窗口设置未完成；基础 TCP 配置已保留。'
@@ -1749,12 +1833,13 @@ rollback() {
 menu() {
   require_linux; line; say "VPS TCP 自适应调优器 v$VERSION"; line
   yellow "$(cat <<'EOF'
-1) 一键调优（推荐；可直接按套餐带宽调优）
-2) 深度自适应实验（缓冲区 + FQ 双向 A/B，流量较大）
-3) 按已知带宽/RTT 调优
-4) 仅检测
-5) 查看状态
-6) 回滚
+1) 五阶段一键调优（推荐；测速、拐点扫描、自动整形、复测）
+2) 快速基础调优（无测速；直接按套餐带宽应用）
+3) 深度自适应实验（缓冲区 + FQ 双向 A/B，流量较大）
+4) 按已知带宽/RTT 调优
+5) 仅检测
+6) 查看状态
+7) 回滚
 0) 退出
 EOF
 )"
@@ -1763,18 +1848,14 @@ EOF
   case "$choice" in
     1)
       yellow '[套餐带宽 Mbit/s（推荐填数字；回车则先自动测速）] '; read -r BANDWIDTH_MBIT
+      yellow '[测速对端域名或 IPv4（回车自动选择公共节点）] '; read -r PEER
       yellow '[用途 general=通用 / proxy=代理加速 / server=建站服务，默认 proxy] '; read -r ROLE; ROLE=${ROLE:-proxy}
-      if [[ -n $BANDWIDTH_MBIT ]]; then
-        RTT_MS=$AUTO_TARGET_RTT_MS
-        say "基础调优默认按 ${RTT_MS}ms 跨境目标 RTT 推导；高级用法可用 tune --rtt 覆盖。"
-        tune
-      else
-        yellow '[对端域名或 IPv4，回车自动选择公共节点] '; read -r PEER; auto
-      fi
+      wizard
       ;;
-    2) yellow '[对端域名或 IPv4，回车自动选择公共节点] '; read -r PEER; yellow '[用途 general=通用 / proxy=代理加速 / server=建站服务，默认 general] '; read -r ROLE; ROLE=${ROLE:-general}; deep ;;
-    3) yellow '[带宽 Mbit] '; read -r BANDWIDTH_MBIT; yellow '[典型 RTT ms] '; read -r RTT_MS; yellow '[用途 general=通用 / proxy=代理加速 / server=建站服务，默认 general] '; read -r ROLE; ROLE=${ROLE:-general}; apply_tuning ;;
-    4) audit ;; 5) status ;; 6) rollback ;; 0) say '已退出。' ;; *) fail '无效选择。' ;;
+    2) yellow '[套餐带宽 Mbit/s] '; read -r BANDWIDTH_MBIT; yellow '[用途 general=通用 / proxy=代理加速 / server=建站服务，默认 proxy] '; read -r ROLE; ROLE=${ROLE:-proxy}; tune ;;
+    3) yellow '[对端域名或 IPv4，回车自动选择公共节点] '; read -r PEER; yellow '[用途 general=通用 / proxy=代理加速 / server=建站服务，默认 general] '; read -r ROLE; ROLE=${ROLE:-general}; deep ;;
+    4) yellow '[带宽 Mbit] '; read -r BANDWIDTH_MBIT; yellow '[典型 RTT ms] '; read -r RTT_MS; yellow '[用途 general=通用 / proxy=代理加速 / server=建站服务，默认 general] '; read -r ROLE; ROLE=${ROLE:-general}; apply_tuning ;;
+    5) audit ;; 6) status ;; 7) rollback ;; 0) say '已退出。' ;; *) fail '无效选择。' ;;
   esac
 }
 parse_options() {
@@ -1786,7 +1867,7 @@ parse_options() {
 }
 main() {
   COMMAND=${1:-menu}; shift || true; parse_options "$@"
-  case "$COMMAND" in menu) menu ;; audit) audit ;; measure|verify) measure ;; tune) tune ;; auto) auto ;; deep) deep ;; apply) apply_tuning ;; shape) shape ;; unshape) unshape ;; status) status ;; rollback) rollback ;; help|-h|--help) usage ;; *) fail "未知命令：$COMMAND" ;; esac
+  case "$COMMAND" in menu) menu ;; audit) audit ;; measure|verify) measure ;; wizard) wizard ;; tune) tune ;; auto) auto ;; deep) deep ;; apply) apply_tuning ;; shape) shape ;; unshape) unshape ;; status) status ;; rollback) rollback ;; help|-h|--help) usage ;; *) fail "未知命令：$COMMAND" ;; esac
 }
 if [[ ${VPS_TCP_TUNE_LIBRARY:-0} != 1 ]]; then
   main "$@"
