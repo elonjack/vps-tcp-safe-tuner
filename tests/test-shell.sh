@@ -232,7 +232,7 @@ unset -f sysctl
 WIZARD_TUNE_CALLS=0; WIZARD_PATH_CALLS=0; WIZARD_SHAPER_CALLS=0
 require_root() { :; }; require_linux() { :; }; ensure_iperf3() { :; }; validate_peer() { :; }
 guard_test_traffic() { return 0; }; confirm() { return 0; }
-tune() { WIZARD_TUNE_CALLS=$(( WIZARD_TUNE_CALLS + 1 )); TUNING_APPLIED=1; }
+tune() { WIZARD_TUNE_CALLS=$(( WIZARD_TUNE_CALLS + 1 )); export TUNING_APPLIED=1; }
 path_quality_check() { WIZARD_PATH_CALLS=$(( WIZARD_PATH_CALLS + 1 )); }
 tune_shaper() { WIZARD_SHAPER_CALLS=$(( WIZARD_SHAPER_CALLS + 1 )); }
 export BANDWIDTH_MBIT=1000 BUFFER_BANDWIDTH_MBIT='' RTT_MS='' ROLE=proxy PEER=trusted.example PEER_PORT=5201 BIDIRECTIONAL=1 ASSUME_YES=0 WIZARD_MODE=0 ENABLE_SHAPING=0
