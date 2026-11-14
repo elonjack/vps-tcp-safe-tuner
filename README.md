@@ -11,7 +11,7 @@
 SSH 登录 VPS 后，复制下面两行执行：
 
 ```bash
-curl -fLO https://github.com/elonjack/vps-tcp-safe-tuner/releases/download/v6.3.0/install.sh
+curl -fLO https://github.com/elonjack/vps-tcp-safe-tuner/releases/download/v6.4.0/install.sh
 bash install.sh
 ```
 
@@ -106,7 +106,9 @@ sudo vps-tcp-tune tune --bandwidth 3000 --role proxy
 
 TCP 内存预算按真实页大小推导为总内存的 1/16、1/8、1/4；单 socket 上限采用 2×BDP + 2MiB，并受内存 1/32 与 256MiB 约束。代理和通用角色以 1MiB 作为 TCP 收发缓冲起点，避免 200ms 级路径从很小的发送窗口慢慢爬升；总量仍受 `tcp_mem` 约束。Linux 6.6 起废弃的 `tcp_adv_win_scale` 不作为有效调优项写入。
 
-脚本会显式恢复 Linux 默认启用的 `tcp_sack=1`、`tcp_dsack=1`、`tcp_timestamps=1`，并恢复 `tcp_no_metrics_save=0`。这不是激进参数：它主要修复机器曾被其它调优脚本关闭这些标准能力后，近端零丢包测速正常、国内高延迟有损单线程却只有几 Mbps 的异常状态。所有值都会进入快照、冲突检测、读回验证和回滚。
+自动测速模式不再把公共 iperf3 对端当作端口硬上限：取出站/入站较大实测值后，增加 50% 容量余量并向上取常见端口档位，只用来推导 TCP 自动调谐的最大窗口。例如实测约 1664M 会按 3000M 档推导，在 150ms RTT、内存充足时得到约 109.3MiB 上限。该上限不是每连接预分配，也不会抬高测速成绩或整形速率；显式 `--bandwidth` 仍严格使用用户给定值。
+
+脚本会显式恢复 Linux 默认启用的 `tcp_sack=1`、`tcp_dsack=1`、`tcp_timestamps=1`，并恢复 `tcp_no_metrics_save=0`。v6.4.0 进一步恢复 `tcp_early_retrans=3`、`tcp_recovery=1` 与 `tcp_reordering=3`，让 TLP/RACK 继续负责尾丢包和乱序恢复；同时启用 `tcp_fastopen=3` 的客户端/服务端基础能力。它们主要修复其它调优脚本留下的有害值，不保证改变长连接峰值。所有值都会进入快照、冲突检测、读回验证和回滚。
 
 如果还要自动扫描并验证整形，指定可信近端 iperf3 对端：
 

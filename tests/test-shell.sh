@@ -43,10 +43,19 @@ memory_mib() { printf 2048; }
 export RTT_MS=150
 export ROLE=general
 export BUFFER_MULTIPLIER_OVERRIDE=''
+export BUFFER_BANDWIDTH_MBIT=''
 assert_equals 12747152 "$(calculate_buffer)" '跨境 150ms BDP 缓冲区推导及余量'
 export ROLE=proxy
 assert_equals 12747152 "$(calculate_buffer)" '代理采用 2× BDP + 2MiB 上限'
 assert_equals 67108864 "$(BANDWIDTH_MBIT=3000 RTT_MS=150 calculate_buffer)" '2GiB 内存单 socket 上限'
+assert_equals 3000 "$(estimate_buffer_bandwidth 1664)" '自动测速容量预留并向上取三千兆档位'
+assert_equals 1000 "$(estimate_buffer_bandwidth 600)" '自动测速容量预留并向上取千兆档位'
+export BUFFER_BANDWIDTH_MBIT=3000
+assert_equals 67108864 "$(calculate_buffer)" '自动容量档位仍受内存预算限制'
+memory_mib() { printf 8192; }
+assert_equals 114597152 "$(calculate_buffer)" '三千兆/150ms 自动容量得到约 109.3MiB 窗口'
+memory_mib() { printf 2048; }
+export BUFFER_BANDWIDTH_MBIT=''
 getconf() { printf 65536; }
 assert_equals '2048 4096 8192' "$(calculate_tcp_mem)" '64KiB 页大小的 TCP 内存预算'
 unset -f getconf
@@ -66,6 +75,10 @@ assert_equals 1 "$(setting_value net.ipv4.tcp_sack)" '显式恢复 SACK'
 assert_equals 1 "$(setting_value net.ipv4.tcp_dsack)" '显式恢复 DSACK'
 assert_equals 1 "$(setting_value net.ipv4.tcp_timestamps)" '显式恢复 TCP timestamps'
 assert_equals 0 "$(setting_value net.ipv4.tcp_no_metrics_save)" '恢复 TCP 路由指标缓存'
+assert_equals 3 "$(setting_value net.ipv4.tcp_early_retrans)" '恢复 TLP 尾丢包探测'
+assert_equals 1 "$(setting_value net.ipv4.tcp_recovery)" '恢复 RACK 丢包检测'
+assert_equals 3 "$(setting_value net.ipv4.tcp_reordering)" '撤销激进固定重排序阈值'
+assert_equals 3 "$(setting_value net.ipv4.tcp_fastopen)" '启用客户端与服务端 Fast Open 能力'
 assert_equals 600 "$(setting_value net.core.netdev_budget)" '提高软中断单轮预算'
 unset -f sysctl_exists setting_value
 export ROLE=general

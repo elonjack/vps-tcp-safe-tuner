@@ -6,7 +6,7 @@ set -Eeuo pipefail
 IFS=$'\n\t'
 umask 077
 
-readonly VERSION='6.3.0'
+readonly VERSION='6.4.0'
 readonly STATE_DIR='/var/lib/vps-tcp-safe-tuner'
 readonly SNAPSHOT_FILE="$STATE_DIR/baseline.tsv"
 readonly TRANSACTION_FILE="$STATE_DIR/transaction.tsv"
@@ -31,11 +31,12 @@ readonly BBR_MODULE_MARKER='# Managed by vps-tcp-safe-tuner: load BBR at boot.'
 readonly SHAPE_SCRIPT_MARKER='# Managed by vps-tcp-safe-tuner: egress shaper helper.'
 readonly SHAPE_UNIT_MARKER='# Managed by vps-tcp-safe-tuner: egress shaper unit.'
 readonly AUTO_TARGET_RTT_MS='150'
+readonly AUTO_BUFFER_HEADROOM_PERCENT='150'
 readonly RETRANS_PER_GIB_HARD_LIMIT='2000'
 readonly RETRANS_PER_GIB_MARGIN='500'
 readonly RETRANS_RELATIVE_MULTIPLIER='3'
 
-COMMAND='menu'; ROLE='general'; PEER=''; PEER_PORT='5201'; BANDWIDTH_MBIT=''; RTT_MS=''
+COMMAND='menu'; ROLE='general'; PEER=''; PEER_PORT='5201'; BANDWIDTH_MBIT=''; BUFFER_BANDWIDTH_MBIT=''; RTT_MS=''
 DURATION='12'; WORKERS='4'; ROUNDS='3'; POLICER_ROUNDS='3'; PEER_MAX_RTT='120'; MAX_TEST_GIB='20'; MAX_RATE_SPREAD_PERCENT='40'; BUFFER_MULTIPLIER_OVERRIDE=''; SHAPE_RATE=''; ENABLE_SHAPING=0; BUFFER_SEARCH=0; QDISC_EXPERIMENT=0; DRY_RUN=0; ASSUME_YES=0; NO_INSTALL=0; KEEP_ON_REGRESSION=0; ALLOW_PUBLIC_PEERS=0; ALLOW_HIGH_TRAFFIC=0; BIDIRECTIONAL=1
 ALLOW_SYSCTL_CONFLICTS=0
 SYSCTL_CONFLICT_COUNT=0; SYSCTL_BLOCKING_CONFLICT_COUNT=0
@@ -72,6 +73,7 @@ readonly -a MANAGED_SYSCTL_KEYS=(
   net.core.rmem_max net.core.wmem_max net.ipv4.tcp_rmem net.ipv4.tcp_wmem net.ipv4.tcp_mem
   net.ipv4.tcp_window_scaling net.ipv4.tcp_moderate_rcvbuf net.ipv4.tcp_mtu_probing
   net.ipv4.tcp_sack net.ipv4.tcp_dsack net.ipv4.tcp_timestamps net.ipv4.tcp_no_metrics_save
+  net.ipv4.tcp_early_retrans net.ipv4.tcp_recovery net.ipv4.tcp_reordering net.ipv4.tcp_fastopen
   net.ipv4.tcp_slow_start_after_idle net.core.netdev_max_backlog net.core.netdev_budget net.core.somaxconn
   net.ipv4.tcp_max_syn_backlog net.ipv4.ip_local_port_range
 )
@@ -558,12 +560,24 @@ derive_network_facts() {
   is_positive_integer "$BANDWIDTH_MBIT" || fail '无法推导出口带宽；请提供 --bandwidth 或使用 --peer 测试。'
   is_positive_integer "$RTT_MS" || fail '无法取得 RTT；请提供 --rtt（例如中国方向常用 150）。'
 }
+estimate_buffer_bandwidth() {
+  local observed=$1 target tier
+  is_positive_integer "$observed" || return 1
+  target=$(( (observed * AUTO_BUFFER_HEADROOM_PERCENT + 99) / 100 ))
+  # 公共 iperf3 对端常先成为瓶颈。缓冲区上限不是预分配，因此自动模式按
+  # 1.5 倍实测值向上取常见端口档位，避免一次偏低测速永久压小高 BDP 窗口。
+  for tier in 100 200 300 500 1000 2000 3000 5000 10000 20000 40000 100000; do
+    if (( target <= tier )); then printf '%s' "$tier"; return 0; fi
+  done
+  printf '100000'
+}
 calculate_buffer() {
-  local bdp multiplier cap result memory
+  local bdp multiplier cap result memory buffer_bandwidth
   memory=$(memory_mib); multiplier=2
   [[ -z $BUFFER_MULTIPLIER_OVERRIDE ]] || multiplier=$BUFFER_MULTIPLIER_OVERRIDE
+  buffer_bandwidth=${BUFFER_BANDWIDTH_MBIT:-$BANDWIDTH_MBIT}
   # BDP（字节）= 带宽 Mbit/s × RTT ms × 125；不能遗漏 Mbit/ms 到字节的单位换算。
-  bdp=$(( BANDWIDTH_MBIT * RTT_MS * 125 )); cap=$(( memory * 1024 * 1024 / 32 )); (( cap > 268435456 )) && cap=268435456
+  bdp=$(( buffer_bandwidth * RTT_MS * 125 )); cap=$(( memory * 1024 * 1024 / 32 )); (( cap > 268435456 )) && cap=268435456
   result=$(( bdp * multiplier + 2097152 )); (( result < 4194304 )) && result=4194304; (( result > cap )) && result=$cap; (( result < 4194304 )) && result=4194304
   printf '%s' "$result"
 }
@@ -638,6 +652,10 @@ build_settings() {
   # 在少量丢包下退回到超时恢复。tcp_no_metrics_save=0 同样恢复内核默认行为。
   add_setting net.ipv4.tcp_sack 1; add_setting net.ipv4.tcp_dsack 1
   add_setting net.ipv4.tcp_timestamps 1; add_setting net.ipv4.tcp_no_metrics_save 0
+  # 恢复现代 Linux 的 TLP + RACK 丢包检测基线，并撤销某些旧脚本设置的
+  # tcp_reordering=300。较高的固定重排序阈值会延迟高 RTT 路径上的快速重传。
+  add_setting net.ipv4.tcp_early_retrans 3; add_setting net.ipv4.tcp_recovery 1
+  add_setting net.ipv4.tcp_reordering 3; add_setting net.ipv4.tcp_fastopen 3
   add_setting net.ipv4.tcp_mtu_probing 1; add_setting net.ipv4.tcp_slow_start_after_idle 0
   add_setting net.core.netdev_max_backlog "$backlog"; add_setting net.core.netdev_budget 600
   add_setting net.core.somaxconn "$socket_queue"; add_setting net.ipv4.tcp_max_syn_backlog "$syn_queue"
@@ -667,10 +685,11 @@ show_environment() {
   line
 }
 show_plan() {
-  local i buffer initial_rmem initial_wmem; buffer=$(calculate_buffer); initial_rmem=$(calculate_initial_rmem "$buffer"); initial_wmem=$(calculate_initial_wmem "$buffer"); show_environment
+  local i buffer initial_rmem initial_wmem buffer_bandwidth; buffer=$(calculate_buffer); initial_rmem=$(calculate_initial_rmem "$buffer"); initial_wmem=$(calculate_initial_wmem "$buffer"); buffer_bandwidth=${BUFFER_BANDWIDTH_MBIT:-$BANDWIDTH_MBIT}; show_environment
   say "用途=$ROLE；带宽=${BANDWIDTH_MBIT} Mbit/s；业务目标 RTT=${RTT_MS} ms；推导缓冲区上限=${buffer} 字节；初始接收/发送缓冲区=${initial_rmem}/${initial_wmem} 字节。"
+  [[ -z $BUFFER_BANDWIDTH_MBIT ]] || say "自动测速只代表当时对端能力；窗口容量按 ${buffer_bandwidth} Mbit/s 端口档位推导，实测吞吐仍按 ${BANDWIDTH_MBIT} Mbit/s 记录。"
   say '缓冲区采用 BDP 倍率 + 2MiB 余量；单 socket 上限受内存 1/32 及 256MiB 约束。'
-  say '将显式恢复 SACK、DSACK、TCP timestamps 与路由指标缓存，防止旧调优配置拖垮高延迟有损单流。'
+  say '将显式恢复 SACK、DSACK、TCP timestamps、TLP/RACK 与正常乱序阈值，防止旧调优配置拖垮高延迟有损单流。'
   for i in "${!KEYS[@]}"; do say "${KEYS[$i]}：$(sysctl_value "${KEYS[$i]}") -> ${VALUES[$i]}"; done
   if (( QDISC_EXPERIMENT )); then say '基础候选先保持原活动 qdisc；深度阶段会临时 A/B 测试 FQ，未胜出即精确恢复。'
   else say '将把默认 qdisc 设为 fq，并在精确保存当前活动队列后切换为 FQ；回滚会恢复原队列。'; fi
@@ -744,7 +763,7 @@ write_facts() {
   if (( QDISC_SELECTED_FQ )) || [[ -f $QDISC_TUNE_STATE ]]; then selected_qdisc=fq; fi
   tmp=$(mktemp "$STATE_DIR/facts.XXXXXX") || return 1
   chmod 600 "$tmp" || { rm -f "$tmp"; return 1; }
-  if ! { printf 'role\t%s\n' "$ROLE"; printf 'bandwidth_mbit\t%s\n' "$BANDWIDTH_MBIT"; printf 'target_rtt_ms\t%s\n' "$RTT_MS"; printf 'test_peer_rtt_ms\t%s\n' "${MEASURE_RTT:-}"; printf 'noisy_link\t%s\n' "$NOISY_LINK"; printf 'buffer_bdp_multiplier\t%s\n' "${BUFFER_MULTIPLIER_OVERRIDE:-default}"; printf 'selected_qdisc\t%s\n' "$selected_qdisc"; printf 'tcp_initial_rmem\t%s\n' "$(calculate_initial_rmem "$(calculate_buffer)")"; printf 'tcp_initial_wmem\t%s\n' "$(calculate_initial_wmem "$(calculate_buffer)")"; printf 'peer\t%s\n' "$PEER"; printf 'measured_egress_mbit\t%s\n' "${MEASURE_RATE:-}"; printf 'measured_egress_retrans_per_gib\t%s\n' "${MEASURE_RETRANS_PER_GIB:-}"; printf 'measured_egress_spread_percent\t%s\n' "${MEASURE_RATE_SPREAD:-}"; printf 'measured_ingress_mbit\t%s\n' "${MEASURE_REVERSE_RATE:-}"; printf 'measured_ingress_retrans_per_gib\t%s\n' "${MEASURE_REVERSE_RETRANS_PER_GIB:-}"; printf 'measured_ingress_spread_percent\t%s\n' "${MEASURE_REVERSE_RATE_SPREAD:-}"; printf 'facts_end\t1\n'; } >"$tmp"; then
+  if ! { printf 'role\t%s\n' "$ROLE"; printf 'bandwidth_mbit\t%s\n' "$BANDWIDTH_MBIT"; printf 'buffer_bandwidth_mbit\t%s\n' "${BUFFER_BANDWIDTH_MBIT:-$BANDWIDTH_MBIT}"; printf 'target_rtt_ms\t%s\n' "$RTT_MS"; printf 'test_peer_rtt_ms\t%s\n' "${MEASURE_RTT:-}"; printf 'noisy_link\t%s\n' "$NOISY_LINK"; printf 'buffer_bdp_multiplier\t%s\n' "${BUFFER_MULTIPLIER_OVERRIDE:-default}"; printf 'selected_qdisc\t%s\n' "$selected_qdisc"; printf 'tcp_initial_rmem\t%s\n' "$(calculate_initial_rmem "$(calculate_buffer)")"; printf 'tcp_initial_wmem\t%s\n' "$(calculate_initial_wmem "$(calculate_buffer)")"; printf 'peer\t%s\n' "$PEER"; printf 'measured_egress_mbit\t%s\n' "${MEASURE_RATE:-}"; printf 'measured_egress_retrans_per_gib\t%s\n' "${MEASURE_RETRANS_PER_GIB:-}"; printf 'measured_egress_spread_percent\t%s\n' "${MEASURE_RATE_SPREAD:-}"; printf 'measured_ingress_mbit\t%s\n' "${MEASURE_REVERSE_RATE:-}"; printf 'measured_ingress_retrans_per_gib\t%s\n' "${MEASURE_REVERSE_RETRANS_PER_GIB:-}"; printf 'measured_ingress_spread_percent\t%s\n' "${MEASURE_REVERSE_RATE_SPREAD:-}"; printf 'facts_end\t1\n'; } >"$tmp"; then
     rm -f "$tmp"; return 1
   fi
   tail -n 1 "$tmp" | grep -Fqx $'facts_end\t1' || { rm -f "$tmp"; return 1; }
@@ -1471,6 +1490,8 @@ auto() {
   fi
   BANDWIDTH_MBIT=$baseline_rate
   if (( BIDIRECTIONAL )) && (( baseline_reverse_rate > BANDWIDTH_MBIT )); then BANDWIDTH_MBIT=$baseline_reverse_rate; fi
+  BUFFER_BANDWIDTH_MBIT=$(estimate_buffer_bandwidth "$BANDWIDTH_MBIT")
+  say "自动实测容量为 ${BANDWIDTH_MBIT}Mbit/s；TCP 窗口按实测值的 ${AUTO_BUFFER_HEADROOM_PERCENT}% 向上取 ${BUFFER_BANDWIDTH_MBIT}Mbit/s 常见端口档位。该值只放宽自动调谐上限，不作为测速成绩或整形速率。"
   if [[ -z $RTT_MS ]]; then
     RTT_MS=$AUTO_TARGET_RTT_MS
     say "测速对端 RTT 为 ${MEASURE_RTT:-未取得}ms，仅用于测量质量；BDP 按出站/入站较大吞吐 ${BANDWIDTH_MBIT}Mbit/s 与跨境业务默认目标 RTT ${RTT_MS}ms 推导。"
