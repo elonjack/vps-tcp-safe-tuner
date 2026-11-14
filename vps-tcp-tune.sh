@@ -6,7 +6,7 @@ set -Eeuo pipefail
 IFS=$'\n\t'
 umask 077
 
-readonly VERSION='6.5.0'
+readonly VERSION='6.5.1'
 readonly STATE_DIR='/var/lib/vps-tcp-safe-tuner'
 readonly SNAPSHOT_FILE="$STATE_DIR/baseline.tsv"
 readonly TRANSACTION_FILE="$STATE_DIR/transaction.tsv"
@@ -37,11 +37,11 @@ readonly RETRANS_PER_GIB_MARGIN='500'
 readonly RETRANS_RELATIVE_MULTIPLIER='3'
 
 COMMAND='menu'; ROLE='general'; PEER=''; PEER_PORT='5201'; BANDWIDTH_MBIT=''; BUFFER_BANDWIDTH_MBIT=''; RTT_MS=''
-DURATION='12'; WORKERS='4'; ROUNDS='3'; POLICER_ROUNDS='3'; PEER_MAX_RTT='120'; MAX_TEST_GIB='20'; MAX_RATE_SPREAD_PERCENT='40'; BUFFER_MULTIPLIER_OVERRIDE=''; SHAPE_RATE=''; ENABLE_SHAPING=0; BUFFER_SEARCH=0; QDISC_EXPERIMENT=0; DRY_RUN=0; ASSUME_YES=0; NO_INSTALL=0; KEEP_ON_REGRESSION=0; ALLOW_PUBLIC_PEERS=0; ALLOW_HIGH_TRAFFIC=0; BIDIRECTIONAL=1
+DURATION='12'; WORKERS='4'; ROUNDS='3'; POLICER_ROUNDS='3'; PEER_MAX_RTT='120'; MAX_TEST_GIB='50'; MAX_RATE_SPREAD_PERCENT='40'; BUFFER_MULTIPLIER_OVERRIDE=''; SHAPE_RATE=''; ENABLE_SHAPING=0; BUFFER_SEARCH=0; QDISC_EXPERIMENT=0; DRY_RUN=0; ASSUME_YES=0; NO_INSTALL=0; KEEP_ON_REGRESSION=0; ALLOW_PUBLIC_PEERS=0; ALLOW_HIGH_TRAFFIC=0; BIDIRECTIONAL=1
 ALLOW_SYSCTL_CONFLICTS=0
 SYSCTL_CONFLICT_COUNT=0; SYSCTL_BLOCKING_CONFLICT_COUNT=0
 TUNING_APPLIED=0; DEFER_PERSIST=0; BBR_MODULE_CONFIG_CREATED=0
-APPLIED_CHANGED_COUNT=0; APPLIED_UNCHANGED_COUNT=0; WIZARD_MODE=0
+APPLIED_CHANGED_COUNT=0; APPLIED_UNCHANGED_COUNT=0; WIZARD_MODE=0; MENU_MODE=0
 QDISC_SELECTED_FQ=0; QDISC_CHANGED=0; QDISC_ORIGINAL_IFACE=''; QDISC_ORIGINAL_KIND=''; QDISC_ORIGINAL_SPEC=''; QDISC_BACKUP_FILE=''
 NOISY_LINK=0
 INITCWND=32
@@ -117,7 +117,7 @@ vps-tcp-tune - 自适应 Linux VPS TCP 调优工具
   --policer-rounds N   每个限速器候选的测试轮数，默认 3，范围 2 到 5
   --peer-max-rtt MS    自动选择公共对端的最大 RTT，默认 120 ms
   --allow-public-peers 明确允许探测并测速内置第三方公共节点；非交互自动选择时必需
-  --max-test-gib N     单个阶段允许的估算流量上限，默认 20 GiB
+  --max-test-gib N     单个阶段允许的估算流量上限，默认 50 GiB
   --allow-high-traffic 明确允许超过流量上限；--yes 不会代替此授权
   --max-rate-spread N  多轮吞吐最大波动百分比，默认 40；超出则拒绝据此调优
   --forward-only       只测试 VPS 出站；默认同时测试出站和入站
@@ -157,6 +157,22 @@ confirm() {
   local message=$1 answer
   (( ASSUME_YES )) && { say "$message（已由 --yes 确认）"; return 0; }
   [[ -t 0 ]] || fail '非交互运行需要 --yes；整形还需要 --enable-shaping。'
+  yellow "[确认] $message [y/N] "
+  read -r answer
+  [[ $answer == y || $answer == Y || $answer == yes || $answer == YES ]]
+}
+
+confirm_default_yes() {
+  local message=$1 answer
+  (( ASSUME_YES )) && { say "$message（已由 --yes 确认）"; return 0; }
+  [[ -t 0 || $MENU_MODE == 1 ]] || fail '非交互运行需要 --yes。'
+  yellow "[确认] $message [Y/n] "
+  read -r answer
+  [[ -z $answer || $answer == y || $answer == Y || $answer == yes || $answer == YES ]]
+}
+
+confirm_high_traffic() {
+  local message=$1 answer
   yellow "[确认] $message [y/N] "
   read -r answer
   [[ $answer == y || $answer == Y || $answer == yes || $answer == YES ]]
@@ -392,7 +408,7 @@ guard_test_traffic() {
     return 0
   fi
   MEASURE_FAILURE="$label 估算约 ${estimated_gib} GiB，超过上限 ${MAX_TEST_GIB} GiB"
-  warn "$MEASURE_FAILURE；未发送该阶段测速流量。需要继续时显式加入 --allow-high-traffic。"
+  warn "$MEASURE_FAILURE；尚未发送该阶段测速流量。交互向导可选择只做基础调优，命令行需显式加入 --allow-high-traffic。"
   return 1
 }
 MEASURE_RATE=''; MEASURE_RETRANS=''; MEASURE_RETRANS_PER_GIB=''; MEASURE_TRANSFER_MIB=''; MEASURE_RATE_SPREAD=''; MEASURE_NOISY=0
@@ -1422,6 +1438,31 @@ probe_shaper_candidate() {
   say "扫描 ${candidate_rate}Mbit：中位吞吐 ${MEASURE_RATE}Mbit，重传 ${MEASURE_RETRANS_PER_GIB} 次/GiB。"
   policer_candidate_is_clean "$MEASURE_RATE" "$MEASURE_RETRANS_PER_GIB" "$candidate_rate" "$baseline_retrans_per_gib"
 }
+probe_adaptive_shaper_candidate() {
+  local iface=$1 original=$2 original_spec=$3 candidate_rate=$4 baseline_retrans_per_gib=$5
+  local saved_rounds=$ROUNDS probe_status
+  ROUNDS=1
+  if probe_shaper_candidate "$iface" "$original" "$original_spec" "$candidate_rate" "$baseline_retrans_per_gib"; then
+    ROUNDS=$saved_rounds
+    return 0
+  else
+    probe_status=$?
+  fi
+  if (( probe_status != 1 )); then
+    ROUNDS=$saved_rounds
+    return 2
+  fi
+  say "${candidate_rate}Mbit 首个样本疑似进入丢包区，改用 ${POLICER_ROUNDS} 轮复核，避免瞬时抖动误判拐点。"
+  ROUNDS=$POLICER_ROUNDS
+  if probe_shaper_candidate "$iface" "$original" "$original_spec" "$candidate_rate" "$baseline_retrans_per_gib"; then
+    ROUNDS=$saved_rounds
+    return 0
+  else
+    probe_status=$?
+  fi
+  ROUNDS=$saved_rounds
+  return "$probe_status"
+}
 path_quality_check() {
   validate_peer; ensure_iperf3; require_command tc
   local iface original original_spec snapshot qdisc_backup target_rate
@@ -1456,7 +1497,7 @@ path_quality_check() {
 scan_shaper_candidate() {
   RECOMMENDED_SHAPE_RATE=''
   validate_peer; ensure_iperf3; require_command tc
-  local nominal candidate best='' last_clean='' broke_at='' iface original original_spec snapshot saved_rounds saved_bidirectional baseline_retrans_per_gib qdisc_backup probe_status safe_rate
+  local nominal candidate best='' last_clean='' broke_at='' iface original original_spec snapshot saved_rounds saved_bidirectional baseline_retrans_per_gib qdisc_backup probe_status safe_rate refine_steps=0
   local -a coarse=(55 70 82 90 96 100 106 114 123 133 145)
   iface=$(default_interface); [[ -n $iface ]] || fail '未检测到默认出口网卡。'
   validate_iface "$iface"
@@ -1465,18 +1506,18 @@ scan_shaper_candidate() {
   IFS=$'\t' read -r original original_spec <<<"$snapshot"
   [[ $original == mq ]] || rm -f -- "$qdisc_backup"
   nominal=${MEASURE_RATE:-$BANDWIDTH_MBIT}
-  guard_test_traffic '限速器拐点扫描（最坏情况）' "$nominal" "$(( POLICER_ROUNDS * 32 ))" || { warn '已跳过高流量限速器扫描；基础 TCP 调优不受影响。'; remove_qdisc_snapshot "$qdisc_backup"; return 0; }
+  guard_test_traffic '限速器拐点扫描（自适应上限）' "$nominal" "$(( ${#coarse[@]} + 4 + POLICER_ROUNDS ))" || { warn '已跳过高流量限速器扫描；基础 TCP 调优不受影响。'; remove_qdisc_snapshot "$qdisc_backup"; return 0; }
   baseline_retrans_per_gib=${MEASURE_RETRANS_PER_GIB:-0}
   say "开始限速器拐点扫描：以 ${nominal}Mbit 全速基线从 55% 到 145% 自适应粗扫。"
-  say "每个候选使用 ${POLICER_ROUNDS} 轮测试；判定会同时参考基线重传噪声和送达率。"
-  say '发现拐点后使用二分法精扫；每轮临时 HTB+FQ 后都会恢复原 qdisc。'
+  say "正常候选只测 1 轮；只有疑似丢包拐点才使用 ${POLICER_ROUNDS} 轮复核。"
+  say '发现拐点后最多二分精扫 4 档；每轮临时 HTB+FQ 后都会恢复原 qdisc。'
   confirm "扫描会暂时替换 $iface 的根 qdisc，预计消耗较多流量。继续吗？" || { remove_qdisc_snapshot "$qdisc_backup"; say '已跳过扫描。'; return 0; }
-  saved_rounds=$ROUNDS; saved_bidirectional=$BIDIRECTIONAL; ROUNDS=$POLICER_ROUNDS; BIDIRECTIONAL=0
+  saved_rounds=$ROUNDS; saved_bidirectional=$BIDIRECTIONAL; BIDIRECTIONAL=0
   trap 'restore_root_qdisc "$iface" "$original" "$original_spec" >/dev/null 2>&1 || true; remove_qdisc_snapshot "$qdisc_backup"; ROUNDS=$saved_rounds; BIDIRECTIONAL=$saved_bidirectional' EXIT
   trap 'exit 130' INT TERM HUP
   for candidate in "${coarse[@]}"; do
     SHAPE_RATE=$(( nominal * candidate / 100 ))
-    if probe_shaper_candidate "$iface" "$original" "$original_spec" "$SHAPE_RATE" "$baseline_retrans_per_gib"; then
+    if probe_adaptive_shaper_candidate "$iface" "$original" "$original_spec" "$SHAPE_RATE" "$baseline_retrans_per_gib"; then
       last_clean=$SHAPE_RATE; best=$SHAPE_RATE
     else
       probe_status=$?
@@ -1487,9 +1528,10 @@ scan_shaper_candidate() {
   done
   if [[ -n $last_clean && -n $broke_at ]]; then
     say "拐点区间：${last_clean} 到 ${broke_at} Mbit，开始二分精扫。"
-    while (( broke_at - last_clean > 1 )); do
+    while (( broke_at - last_clean > 1 && refine_steps < 4 )); do
+      refine_steps=$(( refine_steps + 1 ))
       candidate=$(( (last_clean + broke_at) / 2 ))
-      if probe_shaper_candidate "$iface" "$original" "$original_spec" "$candidate" "$baseline_retrans_per_gib"; then
+      if probe_adaptive_shaper_candidate "$iface" "$original" "$original_spec" "$candidate" "$baseline_retrans_per_gib"; then
         last_clean=$candidate; best=$candidate
       else
         probe_status=$?
@@ -1603,8 +1645,10 @@ tune_shaper() {
   if ! measure; then warn '验证样本不足；已保留完成的基础调优，跳过整形。'; return 0; fi
   base_rate=$MEASURE_RATE; base_retrans=$MEASURE_RETRANS_PER_GIB
   reverse_rate=${MEASURE_REVERSE_RATE:-0}; reverse_retrans=${MEASURE_REVERSE_RETRANS_PER_GIB:-0}
-  if (( WIZARD_MODE == 0 && base_retrans <= RETRANS_PER_GIB_HARD_LIMIT )); then
-    say '出站重传未达到扫描门槛，保持不整形。'; return 0
+  if (( base_retrans <= RETRANS_PER_GIB_HARD_LIMIT )); then
+    say '全速基线重传未达到限速器扫描门槛，保持不整形。'
+    (( WIZARD_MODE == 0 )) || { say '[4/5] 没有发现需要整形的证据。'; say '[5/5] 基础调优已保留；无需继续消耗扫描流量。'; }
+    return 0
   fi
   scan_shaper_candidate
   if [[ -z $RECOMMENDED_SHAPE_RATE ]]; then
@@ -1741,7 +1785,7 @@ remove_runtime_service() {
   if command -v systemctl >/dev/null 2>&1 && [[ -d /run/systemd/system ]]; then systemctl daemon-reload; fi
 }
 wizard() {
-  local saved_yes=$ASSUME_YES estimated_tests
+  local saved_yes=$ASSUME_YES estimated_tests skip_heavy_tests=0
   require_root; require_linux; validate_common; ensure_iperf3
   [[ -n $PEER ]] || auto_pick_peer
   validate_peer
@@ -1754,10 +1798,13 @@ wizard() {
     say "实测容量约 ${BANDWIDTH_MBIT}Mbit/s；TCP 窗口按 ${BUFFER_BANDWIDTH_MBIT}Mbit/s 常见端口档位推导。"
   fi
   [[ -n $RTT_MS ]] || RTT_MS=$AUTO_TARGET_RTT_MS
-  estimated_tests=$(( POLICER_ROUNDS * 32 + ROUNDS * 5 ))
+  estimated_tests=$(( ROUNDS * 4 + POLICER_ROUNDS * 2 + 15 ))
   if ! guard_test_traffic '五阶段一键调优（最坏情况）' "$BANDWIDTH_MBIT" "$estimated_tests"; then
-    if [[ -t 0 && -t 1 ]] && confirm "预计流量超过默认 ${MAX_TEST_GIB}GiB 护栏；明确允许本次高流量扫描吗？"; then
+    if [[ -t 0 || $MENU_MODE == 1 ]] && confirm_high_traffic "预计流量超过默认 ${MAX_TEST_GIB}GiB 护栏；继续完整扫描吗？选择 N 仍会完成基础调优。"; then
       ALLOW_HIGH_TRAFFIC=1
+    elif [[ -t 0 || $MENU_MODE == 1 ]]; then
+      skip_heavy_tests=1
+      warn '已选择 N：不会退出调优；将完成基础 TCP 调优，但跳过路径检测、拐点扫描和满速复测。'
     else
       fail '未获得高流量授权，未修改系统。可改用菜单2快速基础调优。'
     fi
@@ -1765,11 +1812,17 @@ wizard() {
   line
   say '五阶段流程：1 基础调优 → 2 40%路径质量 → 3 policer拐点扫描 → 4 候选整形 → 5 同对端复测。'
   say "带宽=${BANDWIDTH_MBIT}Mbit/s；目标RTT=${RTT_MS}ms；对端=$PEER:$PEER_PORT；用途=$ROLE。"
-  confirm '确认开始五阶段一键调优吗？确认后除异常流量护栏外不再中途询问。' || { say '已取消，未修改系统。'; return 0; }
+  confirm_default_yes '开始调优吗？选择过高流量 N 时将自动降级为基础调优。' || { say '已取消，未修改系统。'; return 0; }
   ASSUME_YES=1; WIZARD_MODE=1; ENABLE_SHAPING=0
   say '[1/5] 基础调优：快照、BBR、活动FQ、自适应缓冲区、丢包恢复与initcwnd。'
   tune
   (( TUNING_APPLIED )) || { ASSUME_YES=$saved_yes; WIZARD_MODE=0; return 0; }
+  if (( skip_heavy_tests )); then
+    say '[2/5–5/5] 已按你的 N 选择跳过高流量检测、扫描与复测；基础调优已经生效。'
+    ASSUME_YES=$saved_yes; WIZARD_MODE=0
+    line; ok '基础调优完成；未因拒绝高流量扫描而退出或撤销。'; line
+    return 0
+  fi
   say '[2/5] 路径质量检测：以40%套餐速率区分线路底噪与出口限速器丢包。'
   path_quality_check || true
   ENABLE_SHAPING=1
@@ -1847,6 +1900,7 @@ EOF
   local choice; yellow '请选择：'; read -r choice
   case "$choice" in
     1)
+      MENU_MODE=1
       yellow '[套餐带宽 Mbit/s（推荐填数字；回车则先自动测速）] '; read -r BANDWIDTH_MBIT
       yellow '[测速对端域名或 IPv4（回车自动选择公共节点）] '; read -r PEER
       yellow '[用途 general=通用 / proxy=代理加速 / server=建站服务，默认 proxy] '; read -r ROLE; ROLE=${ROLE:-proxy}

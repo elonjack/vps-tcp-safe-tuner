@@ -228,10 +228,22 @@ assert_equals 1 "$APPLIED_UNCHANGED_COUNT" '原本一致设置计数'
 verify_built_settings || { printf '设置应用计数测试写入后验证失败。\n' >&2; exit 1; }
 unset -f sysctl
 
+# 自适应扫描应先单轮探测，疑似拐点才多轮复核，并恢复调用方轮数。
+PROBE_CALLS=0; PROBE_ROUNDS=''
+probe_shaper_candidate() {
+  PROBE_CALLS=$(( PROBE_CALLS + 1 )); PROBE_ROUNDS+="${PROBE_ROUNDS:+,}${ROUNDS}"
+  (( PROBE_CALLS > 1 ))
+}
+export ROUNDS=3 POLICER_ROUNDS=3
+probe_adaptive_shaper_candidate eth0 fq '' 1000 0 || { printf '自适应拐点复核测试失败。\n' >&2; exit 1; }
+assert_equals 2 "$PROBE_CALLS" '疑似拐点触发一次多轮复核'
+assert_equals '1,3' "$PROBE_ROUNDS" '粗扫单轮、疑点三轮'
+assert_equals 3 "$ROUNDS" '自适应探测后恢复调用方轮数'
+
 # 五阶段向导必须按顺序调用基础调优、40%路径检测和整形扫描/复测。
 WIZARD_TUNE_CALLS=0; WIZARD_PATH_CALLS=0; WIZARD_SHAPER_CALLS=0
 require_root() { :; }; require_linux() { :; }; ensure_iperf3() { :; }; validate_peer() { :; }
-guard_test_traffic() { return 0; }; confirm() { return 0; }
+guard_test_traffic() { return 0; }; confirm() { return 0; }; confirm_default_yes() { return 0; }
 tune() { WIZARD_TUNE_CALLS=$(( WIZARD_TUNE_CALLS + 1 )); export TUNING_APPLIED=1; }
 path_quality_check() { WIZARD_PATH_CALLS=$(( WIZARD_PATH_CALLS + 1 )); }
 tune_shaper() { WIZARD_SHAPER_CALLS=$(( WIZARD_SHAPER_CALLS + 1 )); }
@@ -241,5 +253,15 @@ assert_equals 1 "$WIZARD_TUNE_CALLS" '五阶段向导调用基础调优'
 assert_equals 1 "$WIZARD_PATH_CALLS" '五阶段向导调用路径质量检测'
 assert_equals 1 "$WIZARD_SHAPER_CALLS" '五阶段向导调用整形扫描和复测'
 assert_equals 0 "$WIZARD_MODE" '五阶段向导完成后恢复模式标记'
+
+# 菜单中拒绝高流量扫描不能退出整个调优；应只做基础调优并跳过高流量阶段。
+WIZARD_TUNE_CALLS=0; WIZARD_PATH_CALLS=0; WIZARD_SHAPER_CALLS=0
+guard_test_traffic() { return 1; }; confirm_high_traffic() { return 1; }
+export MENU_MODE=1 ALLOW_HIGH_TRAFFIC=0 TUNING_APPLIED=0
+wizard >/dev/null 2>&1
+assert_equals 1 "$WIZARD_TUNE_CALLS" '拒绝高流量后仍调用基础调优'
+assert_equals 0 "$WIZARD_PATH_CALLS" '拒绝高流量后跳过路径检测'
+assert_equals 0 "$WIZARD_SHAPER_CALLS" '拒绝高流量后跳过扫描和复测'
+assert_equals 0 "$ALLOW_HIGH_TRAFFIC" '拒绝高流量不会误设授权'
 
 printf 'Shell 功能测试通过。\n'
